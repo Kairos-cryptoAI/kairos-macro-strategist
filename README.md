@@ -13,7 +13,7 @@ swans and adapts to regime changes.
 A `StrategicAllocation`: market `regime`, `stable_reserve_pct`, per-strategy `weights` and
 `max_gross_leverage`. Example defensive posture from the spec: *60% to stablecoins, 40% on
 low-risk delta-neutral strategies*. Invalid model output degrades to exactly that defensive
-fallback. Model calls go through [`kairos-llm`](https://github.com/TheLitis/kairos-llm) at
+fallback. Model calls go through [`kairos-llm`](https://github.com/Kairos-cryptoAI/kairos-llm) at
 `xhigh` effort.
 
 ## Run
@@ -25,4 +25,4 @@ python -m kairos_macro
 Emits `kairos.macro.allocation`.
 
 ---
-Part of the [Kairos](https://github.com/TheLitis/kairos) system. MIT licensed.
+Part of the [Kairos](https://github.com/Kairos-cryptoAI/kairos) system. MIT licensed.
