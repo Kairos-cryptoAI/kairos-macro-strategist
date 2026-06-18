@@ -1,4 +1,8 @@
-"""Call the xhigh model and parse a StrategicAllocation."""
+"""Call the xhigh model and parse a StrategicAllocation.
+
+Runs at ReasoningEffort.XHIGH, which kairos-llm routes to GPT-5.5 with
+reasoning.effort=xhigh — the slow, defensive capital-allocation tier.
+"""
 from __future__ import annotations
 
 from kairos_core.contracts import StrategicAllocation
