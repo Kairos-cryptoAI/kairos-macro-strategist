@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from kairos_core.bus import build_bus
 from kairos_core.enums import StrategicTrigger
+from kairos_core.contracts import LLMHealthEvent
 from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
 
@@ -24,8 +25,13 @@ class MacroService:
         self.detector = ShockDetector(self.settings.crash_pct_1h)
         if gateway is None:
             from kairos_llm import LLMGateway
-            gateway = LLMGateway()
+            gateway = LLMGateway(on_health=self._publish_health)
         self.strategist = MacroStrategist(gateway, source=self.settings.service_name)
+
+    async def _publish_health(self, model: str, provider: str, ok: bool, kind: str, latency_s: float) -> None:
+        await self.bus.publish(Topics.LLM_HEALTH, LLMHealthEvent(
+            source=self.settings.service_name, provider=provider, model=model,
+            ok=ok, kind=kind, latency_s=latency_s))
 
     async def run_once(self, trigger: StrategicTrigger) -> None:
         # In production these come from TimescaleDB + macro/on-chain feeds.
