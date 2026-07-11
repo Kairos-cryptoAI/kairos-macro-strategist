@@ -53,7 +53,9 @@ class MacroService:
             await asyncio.sleep(30)
 
     async def run(self) -> None:  # pragma: no cover - network
-        configure_logging(self.settings.log_level, json_logs=self.settings.log_json, service=self.settings.service_name)
+        configure_logging(
+            self.settings.log_level, json_logs=self.settings.log_json, service=self.settings.service_name
+        )
         log.info("macro.start")
         await self._scheduler()
 

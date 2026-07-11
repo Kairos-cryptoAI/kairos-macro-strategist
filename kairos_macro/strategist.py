@@ -18,7 +18,9 @@ class MacroStrategist:
 
     async def allocate(self, context_json: str, *, trigger: StrategicTrigger) -> StrategicAllocation:
         try:
-            res = await self.gateway.complete(system=MACRO_SYSTEM, user=context_json, effort=ReasoningEffort.XHIGH)
+            res = await self.gateway.complete(
+                system=MACRO_SYSTEM, user=context_json, effort=ReasoningEffort.XHIGH
+            )
             data = res.parsed if isinstance(res.parsed, dict) else {}
             return StrategicAllocation(
                 source=self.source,
