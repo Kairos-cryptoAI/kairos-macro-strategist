@@ -1,4 +1,5 @@
 """System prompt for the xhigh strategic allocation call."""
+
 from __future__ import annotations
 
 MACRO_SYSTEM = """You are the Macro-Strategist of a crypto futures fund. You think slowly and

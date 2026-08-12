@@ -1,21 +1,28 @@
-"""Assemble the large strategic context fed to the xhigh model."""
+"""Assemble the strategic context fed to the xhigh model."""
+
 from __future__ import annotations
 
 import json
-from typing import Any, Dict
+from collections.abc import Mapping
+from typing import Any
 
 
-def build_macro_context(*, portfolio: Dict[str, Any], week_pnl_pct: float,
-                        regime_hint: str, macro: Dict[str, Any],
-                        onchain: Dict[str, Any] | None = None) -> str:
-    """Unlike the Aggregator's tiny context, the Macro layer gets a rich brief:
-    a week of performance, portfolio state, macro reports and on-chain metrics.
-    """
-    ctx = {
-        "portfolio": portfolio,                # {equity, stable_pct, positions:[...]}
-        "performance": {"week_pnl_pct": round(week_pnl_pct, 2)},
+def build_macro_context(
+    *,
+    portfolio: Mapping[str, Any],
+    performance: Mapping[str, Any],
+    regime_hint: str,
+    macro: Mapping[str, Any],
+    onchain: Mapping[str, Any] | None = None,
+    trigger: Mapping[str, Any] | None = None,
+) -> str:
+    """Serialize a bounded, real-data strategic brief for the model."""
+    context = {
+        "portfolio": dict(portfolio),
+        "performance": dict(performance),
         "regime_hint": regime_hint,
-        "macro": macro,                        # {cpi, fed_rate, dxy, ...}
-        "onchain": onchain or {},              # {active_addresses, exchange_netflow, ...}
+        "macro": dict(macro),
+        "onchain": dict(onchain or {}),
+        "trigger": dict(trigger or {}),
     }
-    return json.dumps(ctx, separators=(",", ":"))
+    return json.dumps(context, separators=(",", ":"), sort_keys=True)
