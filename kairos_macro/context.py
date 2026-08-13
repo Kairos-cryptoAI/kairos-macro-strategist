@@ -12,8 +12,10 @@ def build_macro_context(
     portfolio: Mapping[str, Any],
     performance: Mapping[str, Any],
     regime_hint: str,
-    macro: Mapping[str, Any],
-    onchain: Mapping[str, Any] | None = None,
+    regime_evidence: Mapping[str, Any],
+    market_factors: Mapping[str, Any],
+    macro_factors: Mapping[str, Any],
+    onchain_factors: Mapping[str, Any],
     trigger: Mapping[str, Any] | None = None,
 ) -> str:
     """Serialize a bounded, real-data strategic brief for the model."""
@@ -21,8 +23,10 @@ def build_macro_context(
         "portfolio": dict(portfolio),
         "performance": dict(performance),
         "regime_hint": regime_hint,
-        "macro": dict(macro),
-        "onchain": dict(onchain or {}),
+        "regime_evidence": dict(regime_evidence),
+        "market_factors": dict(market_factors),
+        "macro_factors": dict(macro_factors),
+        "onchain_factors": dict(onchain_factors),
         "trigger": dict(trigger or {}),
     }
     return json.dumps(context, separators=(",", ":"), sort_keys=True)

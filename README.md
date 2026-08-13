@@ -19,11 +19,25 @@ per-symbol cooldown. The current core contract has no structured macro-release t
 so CPI and similar surprise-sigma triggers remain available in `ShockDetector` but are
 not fabricated from news text.
 
+The model context keeps factor families explicit. `market_factors` contains only
+fresh technical and derivatives observations together with units and symbol coverage;
+`macro_factors` and `onchain_factors` are marked `unavailable` until dedicated
+structured bus topics exist. Missing evidence is uncertainty, never a neutral print.
+The `regime_hint` is a deterministic strict majority of fresh `quant_bias` values and
+the exact counts/method are included as `regime_evidence`.
+
 ## Safety and replay behavior
 
 - The model receives a strict Pydantic Structured Outputs schema.
 - Missing reconciled account data yields a deterministic defensive allocation instead
   of sending an empty or invented portfolio to the model.
+- Stale/future account data or fewer than `KAIROS_MINIMUM_FRESH_MARKETS` fresh market
+  snapshots also yield the defensive allocation without an LLM call. A frozen clock is
+  injectable in tests, so all freshness decisions are reproducible offline.
+- A one-hour crash requires a baseline within the configured tolerance around the
+  one-hour mark; an arbitrary older price is never mislabeled as a 1h move.
+- Model allocations must assign exactly 100% of capital across stable reserve and
+  named strategies; under-allocation is rejected as ambiguous.
 - If the daily schedule fires before account reconciliation, the defensive allocation
   is followed by a separately identified context-recovery allocation as soon as a full
   account snapshot arrives in normal system mode.

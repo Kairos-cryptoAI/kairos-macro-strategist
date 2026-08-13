@@ -28,8 +28,10 @@ class AllocationOutput(BaseModel):
     @model_validator(mode="after")
     def validate_total_allocation(self) -> AllocationOutput:
         total = self.stable_reserve_pct + sum(self.strategy_weights.values())
-        if total > 1.0001:
-            raise ValueError(f"total allocation exceeds 1.0: {total:.4f}")
+        if not 0.9999 <= total <= 1.0001:
+            raise ValueError(f"total allocation must equal 1.0: {total:.4f}")
+        if any(not name or name != name.strip() for name in self.strategy_weights):
+            raise ValueError("strategy names must be non-empty and whitespace-normalized")
         return self
 
 

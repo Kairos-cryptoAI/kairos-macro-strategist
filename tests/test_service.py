@@ -156,10 +156,11 @@ def _market(
     )
 
 
-def _service() -> tuple[MacroService, _FakeGateway, _FakeBus]:
+def _service(now: datetime | None = None) -> tuple[MacroService, _FakeGateway, _FakeBus]:
     gateway = _FakeGateway()
     bus = _FakeBus()
-    return MacroService(_settings(), gateway=gateway, bus=bus), gateway, bus
+    clock = (lambda: now) if now is not None else None
+    return MacroService(_settings(), gateway=gateway, bus=bus, clock=clock), gateway, bus
 
 
 def test_gateway_health_hook_is_wired_for_production_gateway():
@@ -168,8 +169,8 @@ def test_gateway_health_hook_is_wired_for_production_gateway():
 
 
 async def test_run_once_uses_real_account_and_market_context():
-    service, gateway, bus = _service()
     now = datetime(2026, 8, 12, tzinfo=UTC)
+    service, gateway, bus = _service(now)
     service._ingest_account(_envelope(Topics.ACCOUNT_SNAPSHOT, _account(now).to_payload(), "account"))
     service._ingest_market(_market(95, now, message_id="market-1"))
 
@@ -180,11 +181,16 @@ async def test_run_once_uses_real_account_and_market_context():
     )
 
     context = json.loads(gateway.calls[0]["user"])
+    assert context["portfolio"]["message_id"] == "account-1"
     assert context["portfolio"]["equity_usd"] == 12_000
     assert context["portfolio"]["positions"][0]["symbol"] == "BTCUSDT"
     assert context["performance"]["sample_count"] == 1
     assert context["performance"]["full_window"] is False
-    assert context["macro"]["markets"]["BTCUSDT"]["mid_price"] == 95
+    assert context["market_factors"]["values"]["BTCUSDT"]["mid_price"] == 95
+    assert context["market_factors"]["values"]["BTCUSDT"]["message_id"] == "market-1"
+    assert context["market_factors"]["units"]["funding_rate"] == "fraction"
+    assert context["macro_factors"]["status"] == "unavailable"
+    assert context["onchain_factors"]["status"] == "unavailable"
     assert gateway.calls[0]["workload"] is LLMWorkload.MACRO_STRATEGIST
     assert gateway.calls[0]["schema"] is AllocationOutput
     assert allocation.message_id == "macro:schedule:2026-08-12:00"
@@ -192,8 +198,8 @@ async def test_run_once_uses_real_account_and_market_context():
 
 
 def test_newer_reconciliation_failure_revokes_context_and_old_success_cannot_restore_it():
-    service, _, _ = _service()
     now = datetime(2026, 8, 12, tzinfo=UTC)
+    service, _, _ = _service(now)
     current = _account(now)
     failure = _account(now + timedelta(seconds=2)).model_copy(
         update={"reconciled": False, "reconciliation_detail": "positions unavailable"}
@@ -209,8 +215,8 @@ def test_newer_reconciliation_failure_revokes_context_and_old_success_cannot_res
 
 
 def test_regime_hint_requires_a_true_majority():
-    service, _, _ = _service()
     now = datetime(2026, 8, 12, tzinfo=UTC)
+    service, _, _ = _service(now)
     long_market = _market(100, now, message_id="btc", bias=Side.LONG)
     flat_eth = _market(100, now, message_id="eth", bias=Side.FLAT).model_copy(update={"symbol": "ETHUSDT"})
     flat_sol = _market(100, now, message_id="sol", bias=Side.FLAT).model_copy(update={"symbol": "SOLUSDT"})
@@ -224,7 +230,99 @@ def test_regime_hint_requires_a_true_majority():
             update={"symbol": "ETHUSDT"}
         )
     )
-    assert service._regime_hint() == "BULL"
+    assert service._regime_hint(now) == "CHOP"
+    assert service._regime_hint(now + timedelta(seconds=1)) == "BULL"
+
+
+def test_regime_and_context_exclude_stale_markets():
+    now = datetime(2026, 8, 12, tzinfo=UTC)
+    service, _, _ = _service(now)
+    stale = _market(
+        100,
+        now - timedelta(seconds=service.settings.market_snapshot_max_age_s + 1),
+        message_id="stale",
+        bias=Side.LONG,
+    )
+    fresh = _market(99, now, message_id="fresh", bias=Side.FLAT).model_copy(update={"symbol": "ETHUSDT"})
+    service._ingest_market(stale)
+    service._ingest_market(fresh)
+
+    assert service._regime_hint() == "CHOP"
+    market_context = service._market_context(now)
+    assert market_context["coverage"]["fresh_symbols"] == ["ETHUSDT"]
+    assert set(market_context["values"]) == {"ETHUSDT"}
+
+
+def test_market_snapshot_after_evaluation_time_only_applies_later():
+    now = datetime(2026, 8, 12, tzinfo=UTC)
+    service, _, _ = _service(now)
+    future = _market(
+        101,
+        now + timedelta(seconds=1),
+        message_id="future-market",
+        bias=Side.LONG,
+    )
+    service._ingest_market(future)
+
+    assert service._regime_hint(now) == "CHOP"
+    assert service._market_context(now)["values"] == {}
+    assert service._regime_hint(now + timedelta(seconds=1)) == "BULL"
+    assert set(service._market_context(now + timedelta(seconds=1))["values"]) == {"BTCUSDT"}
+
+
+def test_market_snapshot_replay_is_immutable():
+    now = datetime(2026, 8, 12, tzinfo=UTC)
+    service, _, _ = _service(now)
+    original = _market(100, now, message_id="immutable")
+
+    assert service._ingest_market(original) is True
+    assert service._ingest_market(original) is True
+
+    changed = original.model_copy(update={"mid_price": 80.0})
+    with pytest.raises(ValueError, match="message_id .* was reused"):
+        service._ingest_market(changed)
+
+    assert service._latest_markets[original.symbol].mid_price == 100
+
+
+async def test_stale_account_abstains_without_model_call():
+    now = datetime(2026, 8, 12, tzinfo=UTC)
+    service, gateway, _ = _service(now)
+    stale_at = now - timedelta(seconds=service.settings.account_snapshot_max_age_s + 1)
+    service._ingest_account(_envelope(Topics.ACCOUNT_SNAPSHOT, _account(stale_at).to_payload(), "account"))
+    service._ingest_market(_market(100, now, message_id="market"))
+
+    allocation = await service.run_once(StrategicTrigger.SCHEDULE, trigger_id="stale-account")
+
+    assert gateway.calls == []
+    assert allocation.stable_reserve_pct == 0.6
+    assert "account snapshot is stale" in allocation.rationale
+
+
+async def test_missing_fresh_market_abstains_without_model_call():
+    now = datetime(2026, 8, 12, tzinfo=UTC)
+    service, gateway, _ = _service(now)
+    service._ingest_account(_envelope(Topics.ACCOUNT_SNAPSHOT, _account(now).to_payload(), "account"))
+
+    allocation = await service.run_once(StrategicTrigger.SCHEDULE, trigger_id="no-market")
+
+    assert gateway.calls == []
+    assert allocation.stable_reserve_pct == 0.6
+    assert "0 fresh market snapshots" in allocation.rationale
+
+
+def test_future_account_snapshot_is_rejected_without_poisoning_latest_context():
+    now = datetime(2026, 8, 12, tzinfo=UTC)
+    service, _, _ = _service(now)
+    current = _account(now)
+    future = _account(now + timedelta(seconds=6)).model_copy(update={"message_id": "future"})
+    service._ingest_account(_envelope(Topics.ACCOUNT_SNAPSHOT, current.to_payload(), "current"))
+
+    with pytest.raises(ValueError, match="in the future"):
+        service._ingest_account(_envelope(Topics.ACCOUNT_SNAPSHOT, future.to_payload(), "future"))
+
+    assert service._latest_account is not None
+    assert service._latest_account.message_id == current.message_id
 
 
 async def test_reconciled_account_recovers_a_schedule_that_ran_without_context():
@@ -233,7 +331,8 @@ async def test_reconciled_account_recovers_a_schedule_that_ran_without_context()
     envelope = _envelope(Topics.ACCOUNT_SNAPSHOT, account.to_payload(), "account-env")
     bus = _FakeBus({Topics.ACCOUNT_SNAPSHOT: [envelope]})
     gateway = _FakeGateway()
-    service = MacroService(_settings(), gateway=gateway, bus=bus)
+    service = MacroService(_settings(), gateway=gateway, bus=bus, clock=lambda: now)
+    service._ingest_market(_market(95, now, message_id="market"))
     service._pending_schedule_key = "schedule:2026-08-12:00"
 
     await service._consume_accounts()
@@ -245,8 +344,8 @@ async def test_reconciled_account_recovers_a_schedule_that_ran_without_context()
 
 
 async def test_real_market_snapshots_trigger_shock_allocation():
-    service, gateway, bus = _service()
     now = datetime(2026, 8, 12, 12, tzinfo=UTC)
+    service, gateway, bus = _service(now)
     service._ingest_account(_envelope(Topics.ACCOUNT_SNAPSHOT, _account(now).to_payload(), "account"))
     baseline = _market(100, now - timedelta(minutes=61), message_id="baseline")
     crash = _market(88, now, message_id="crash")
@@ -261,6 +360,36 @@ async def test_real_market_snapshots_trigger_shock_allocation():
     assert trigger["symbol"] == "BTCUSDT"
 
 
+async def test_shock_requires_a_baseline_close_to_one_hour():
+    now = datetime(2026, 8, 12, 12, tzinfo=UTC)
+    service, gateway, bus = _service(now)
+    service._ingest_account(_envelope(Topics.ACCOUNT_SNAPSHOT, _account(now).to_payload(), "account"))
+    too_old = _market(100, now - timedelta(minutes=70), message_id="too-old")
+    crash = _market(80, now, message_id="crash")
+    await service._process_market(_envelope(Topics.MARKET_SNAPSHOT, too_old.to_payload(), "old-envelope"))
+
+    await service._process_market(_envelope(Topics.MARKET_SNAPSHOT, crash.to_payload(), "crash"))
+
+    assert gateway.calls == []
+    assert bus.published == []
+
+
+async def test_future_snapshot_within_ingestion_skew_cannot_trigger_shock_early():
+    now = datetime(2026, 8, 12, 12, tzinfo=UTC)
+    service, gateway, bus = _service(now)
+    service._ingest_account(_envelope(Topics.ACCOUNT_SNAPSHOT, _account(now).to_payload(), "account"))
+    baseline = _market(100, now - timedelta(hours=1), message_id="baseline")
+    future_crash = _market(80, now + timedelta(seconds=1), message_id="future-crash")
+    await service._process_market(_envelope(Topics.MARKET_SNAPSHOT, baseline.to_payload(), "baseline"))
+
+    await service._process_market(
+        _envelope(Topics.MARKET_SNAPSHOT, future_crash.to_payload(), "future-crash")
+    )
+
+    assert gateway.calls == []
+    assert bus.published == []
+
+
 async def test_failed_shock_publish_is_unacked_and_reuses_cached_llm_output():
     now = datetime(2026, 8, 12, 12, tzinfo=UTC)
     baseline = _market(100, now - timedelta(minutes=61), message_id="baseline")
@@ -269,7 +398,7 @@ async def test_failed_shock_publish_is_unacked_and_reuses_cached_llm_output():
     bus = _FakeBus({Topics.MARKET_SNAPSHOT: [crash_envelope]})
     bus.fail_publish_once = True
     gateway = _FakeGateway()
-    service = MacroService(_settings(), gateway=gateway, bus=bus)
+    service = MacroService(_settings(), gateway=gateway, bus=bus, clock=lambda: now)
     service._ingest_account(_envelope(Topics.ACCOUNT_SNAPSHOT, _account(now).to_payload(), "account"))
     await service._process_market(_envelope(Topics.MARKET_SNAPSHOT, baseline.to_payload(), "base-env"))
 

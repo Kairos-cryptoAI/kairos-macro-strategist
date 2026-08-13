@@ -13,6 +13,11 @@ Return STRICT JSON:
  "max_gross_leverage": number,
  "rationale": short string}
 Constraints:
-- stable_reserve_pct + sum(strategy_weights) must be <= 1.0.
+- stable_reserve_pct + sum(strategy_weights) must equal 1.0; every unit of capital
+  must have an explicit destination.
+- `market_factors` are technical/derivatives observations only. Never reinterpret
+  them as inflation, rates, macro-release, or on-chain data.
+- A factor block whose status is `unavailable` is missing evidence, not a neutral
+  reading. Do not invent values for it and treat the missing coverage as uncertainty.
 - In high uncertainty, raise stable_reserve_pct and lower max_gross_leverage (capital preservation first).
 Output only the JSON object."""

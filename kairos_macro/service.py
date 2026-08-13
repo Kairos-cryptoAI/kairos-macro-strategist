@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 from collections import OrderedDict, defaultdict, deque
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -29,6 +32,7 @@ class MacroService:
         *,
         gateway: Any | None = None,
         bus: MessageBus | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.settings = settings or MacroSettings()
         self.bus = bus if bus is not None else build_bus(self.settings)
@@ -38,6 +42,7 @@ class MacroService:
 
             gateway = LLMGateway(on_health=self._publish_health)
         self.strategist = MacroStrategist(gateway, source=self.settings.service_name)
+        self._clock = clock or (lambda: datetime.now(UTC))
 
         self.system_mode = SystemMode.NORMAL
         self._latest_account: AccountSnapshot | None = None
@@ -49,10 +54,35 @@ class MacroService:
         self._allocation_cache: OrderedDict[str, StrategicAllocation] = OrderedDict()
         self._handled_market_ids: OrderedDict[str, None] = OrderedDict()
         self._handled_control_ids: OrderedDict[str, None] = OrderedDict()
-        self._ingested_market_ids: OrderedDict[str, None] = OrderedDict()
+        self._ingested_market_ids: OrderedDict[str, str] = OrderedDict()
         self._allocation_lock = asyncio.Lock()
         self._last_schedule_key: str | None = None
         self._pending_schedule_key: str | None = None
+
+    @staticmethod
+    def _require_aware(value: datetime, *, field: str) -> None:
+        if value.utcoffset() is None:
+            raise ValueError(f"{field} must be timezone-aware")
+
+    def _now(self) -> datetime:
+        now = self._clock()
+        self._require_aware(now, field="clock")
+        return now.astimezone(UTC)
+
+    def _freshness_issue(
+        self,
+        *,
+        label: str,
+        observed_at: datetime,
+        reference: datetime,
+        ttl_s: float,
+    ) -> str | None:
+        age_s = (reference - observed_at).total_seconds()
+        if age_s < -self.settings.max_future_skew_s:
+            return f"{label} is {abs(age_s):.3f}s in the future"
+        if age_s > ttl_s:
+            return f"{label} is stale by age {age_s:.3f}s (ttl {ttl_s:.3f}s)"
+        return None
 
     async def _publish_health(
         self,
@@ -80,11 +110,18 @@ class MacroService:
         while len(cache) > self.settings.replay_cache_size:
             cache.popitem(last=False)
 
-    def _portfolio_context(self) -> dict[str, Any]:
+    @staticmethod
+    def _market_digest(snapshot: MarketSnapshot) -> str:
+        payload = json.dumps(snapshot.to_payload(), separators=(",", ":"), sort_keys=True)
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    def _portfolio_context(self, reference: datetime) -> dict[str, Any]:
         account = self._latest_account
         if account is None:
             raise RuntimeError("reconciled account context is unavailable")
         return {
+            "message_id": account.message_id,
+            "source": account.source,
             "exchange": account.exchange,
             "account_id": account.account_id,
             "equity_usd": account.equity_usd,
@@ -96,6 +133,7 @@ class MacroService:
             "realized_pnl_usd": account.realized_pnl_usd,
             "unrealized_pnl_usd": account.unrealized_pnl_usd,
             "captured_at": account.captured_at.isoformat(),
+            "age_s": round(max(0.0, (reference - account.captured_at).total_seconds()), 3),
             "positions": [
                 position.model_dump(
                     mode="json",
@@ -130,8 +168,23 @@ class MacroService:
             "daily_pnl_pct": account.daily_pnl_pct,
         }
 
-    def _regime_hint(self) -> str:
-        biases = [snapshot.quant_bias for snapshot in self._latest_markets.values()]
+    def _fresh_markets(self, reference: datetime) -> dict[str, MarketSnapshot]:
+        return {
+            symbol: snapshot
+            for symbol, snapshot in sorted(self._latest_markets.items())
+            if snapshot.produced_at <= reference
+            and self._freshness_issue(
+                label=f"market snapshot {symbol}",
+                observed_at=snapshot.produced_at,
+                reference=reference,
+                ttl_s=self.settings.market_snapshot_max_age_s,
+            )
+            is None
+        }
+
+    def _regime_hint(self, reference: datetime | None = None) -> str:
+        current_time = reference or self._now()
+        biases = [snapshot.quant_bias for snapshot in self._fresh_markets(current_time).values()]
         long_count = biases.count(Side.LONG)
         short_count = biases.count(Side.SHORT)
         majority = len(biases) // 2 + 1
@@ -141,10 +194,47 @@ class MacroService:
             return "BEAR"
         return "CHOP"
 
-    def _market_context(self) -> dict[str, Any]:
+    def _regime_evidence(self, reference: datetime) -> dict[str, Any]:
+        fresh = self._fresh_markets(reference)
+        counts = {
+            side.value: sum(snapshot.quant_bias is side for snapshot in fresh.values()) for side in Side
+        }
         return {
-            "markets": {
+            "method": "strict_majority_of_fresh_quant_biases",
+            "counts": counts,
+            "fresh_market_count": len(fresh),
+            "required_majority": len(fresh) // 2 + 1 if fresh else 1,
+        }
+
+    def _market_context(self, reference: datetime) -> dict[str, Any]:
+        fresh = self._fresh_markets(reference)
+        configured_symbols = sorted(self.settings.trading_symbols)
+        return {
+            "status": "available" if fresh else "unavailable",
+            "source_topic": Topics.MARKET_SNAPSHOT,
+            "coverage": {
+                "fresh_symbols": sorted(fresh),
+                "configured_symbols": configured_symbols,
+                "fresh_fraction": round(len(fresh) / len(configured_symbols), 4)
+                if configured_symbols
+                else 0.0,
+                "max_age_s": self.settings.market_snapshot_max_age_s,
+            },
+            "units": {
+                "mid_price": "quote_currency_per_base_unit",
+                "volume_usd": "USD",
+                "funding_rate": "fraction",
+                "open_interest": "provider_native_notional",
+                "oi_change_pct_1h": "percent",
+                "long_liquidations_usd": "USD",
+                "short_liquidations_usd": "USD",
+                "rsi_14": "index_0_100",
+                "quant_bias": "categorical_side",
+            },
+            "values": {
                 symbol: {
+                    "message_id": snapshot.message_id,
+                    "source": snapshot.source,
                     "mid_price": snapshot.mid_price,
                     "volume_usd": snapshot.volume_usd,
                     "funding_rate": snapshot.derivatives.funding_rate,
@@ -155,20 +245,51 @@ class MacroService:
                     "rsi_14": snapshot.indicators.rsi_14,
                     "quant_bias": snapshot.quant_bias.value,
                     "produced_at": snapshot.produced_at.isoformat(),
+                    "age_s": round((reference - snapshot.produced_at).total_seconds(), 3),
                 }
-                for symbol, snapshot in sorted(self._latest_markets.items())
-            }
+                for symbol, snapshot in fresh.items()
+            },
         }
 
-    def _context(self, trigger_detail: dict[str, Any]) -> str:
+    def _context(self, trigger_detail: dict[str, Any], reference: datetime) -> str:
         return build_macro_context(
-            portfolio=self._portfolio_context(),
+            portfolio=self._portfolio_context(reference),
             performance=self._performance_context(),
-            regime_hint=self._regime_hint(),
-            macro=self._market_context(),
-            onchain={"status": "not_available_on_current_bus"},
+            regime_hint=self._regime_hint(reference),
+            regime_evidence=self._regime_evidence(reference),
+            market_factors=self._market_context(reference),
+            macro_factors={
+                "status": "unavailable",
+                "reason": "no structured macro-release topic exists on the current bus",
+            },
+            onchain_factors={
+                "status": "unavailable",
+                "reason": "no structured on-chain topic exists on the current bus",
+            },
             trigger=trigger_detail,
         )
+
+    def _context_readiness_issue(self, reference: datetime) -> str | None:
+        account = self._latest_account
+        if account is None:
+            return "missing reconciled account context"
+        if account.captured_at > reference:
+            return "account snapshot postdates the allocation evaluation time"
+        issue = self._freshness_issue(
+            label="account snapshot",
+            observed_at=account.captured_at,
+            reference=reference,
+            ttl_s=self.settings.account_snapshot_max_age_s,
+        )
+        if issue is not None:
+            return issue
+        fresh_market_count = len(self._fresh_markets(reference))
+        if fresh_market_count < self.settings.minimum_fresh_markets:
+            return (
+                f"only {fresh_market_count} fresh market snapshots; "
+                f"minimum is {self.settings.minimum_fresh_markets}"
+            )
+        return None
 
     async def run_once(
         self,
@@ -186,6 +307,7 @@ class MacroService:
                 message_id = f"macro:{trigger_id}"
                 correlation_id = correlation_id or trigger_id
                 detail = trigger_detail or {"kind": trigger.value}
+                reference = self._now()
                 if self.system_mode in {SystemMode.CONFLICT_SAFE, SystemMode.LOCAL_QUANT_MODE}:
                     allocation = self.strategist.defensive(
                         trigger,
@@ -194,17 +316,17 @@ class MacroService:
                         causation_id=causation_id,
                         detail=f"system mode {self.system_mode.value}",
                     )
-                elif self._latest_account is None:
+                elif (readiness_issue := self._context_readiness_issue(reference)) is not None:
                     allocation = self.strategist.defensive(
                         trigger,
                         message_id=message_id,
                         correlation_id=correlation_id,
                         causation_id=causation_id,
-                        detail="missing reconciled account context",
+                        detail=readiness_issue,
                     )
                 else:
                     allocation = await self.strategist.allocate(
-                        self._context(detail),
+                        self._context(detail, reference),
                         trigger=trigger,
                         message_id=message_id,
                         correlation_id=correlation_id,
@@ -225,8 +347,15 @@ class MacroService:
 
     def _ingest_account(self, envelope: BusEnvelope) -> None:
         account = AccountSnapshot.model_validate(envelope.payload)
-        if account.captured_at.utcoffset() is None:
-            raise ValueError("account snapshot captured_at must be timezone-aware")
+        self._require_aware(account.captured_at, field="account snapshot captured_at")
+        future_issue = self._freshness_issue(
+            label="account snapshot",
+            observed_at=account.captured_at,
+            reference=self._now(),
+            ttl_s=float("inf"),
+        )
+        if future_issue is not None:
+            raise ValueError(future_issue)
         latest_at = self._latest_account_captured_at
         if latest_at is not None and account.captured_at < latest_at:
             return
@@ -259,7 +388,12 @@ class MacroService:
     async def _recover_pending_schedule(self) -> None:
         schedule_key = self._pending_schedule_key
         account = self._latest_account
-        if schedule_key is None or account is None or self.system_mode is not SystemMode.NORMAL:
+        if (
+            schedule_key is None
+            or account is None
+            or self.system_mode is not SystemMode.NORMAL
+            or self._context_readiness_issue(self._now()) is not None
+        ):
             return
         await self.run_once(
             StrategicTrigger.SCHEDULE,
@@ -270,24 +404,43 @@ class MacroService:
         )
         self._pending_schedule_key = None
 
-    def _ingest_market(self, snapshot: MarketSnapshot) -> None:
-        if snapshot.message_id in self._ingested_market_ids:
-            return
-        self._remember(self._ingested_market_ids, snapshot.message_id)
+    def _ingest_market(self, snapshot: MarketSnapshot) -> bool:
+        self._require_aware(snapshot.produced_at, field="market snapshot produced_at")
+        future_issue = self._freshness_issue(
+            label="market snapshot",
+            observed_at=snapshot.produced_at,
+            reference=self._now(),
+            ttl_s=float("inf"),
+        )
+        if future_issue is not None:
+            raise ValueError(future_issue)
+        digest = self._market_digest(snapshot)
+        prior_digest = self._ingested_market_ids.get(snapshot.message_id)
+        if prior_digest is not None:
+            if prior_digest != digest:
+                raise ValueError(f"market snapshot message_id {snapshot.message_id!r} was reused")
+            # Exact replay remains eligible so an allocation cached before a
+            # failed publish can be delivered without rerunning the model.
+            return True
+        self._remember(self._ingested_market_ids, snapshot.message_id, digest)
 
         current = self._latest_markets.get(snapshot.symbol)
         if current is not None and snapshot.produced_at < current.produced_at:
-            return
+            return False
         self._latest_markets[snapshot.symbol] = snapshot
         history = self._price_history[snapshot.symbol]
         history.append((snapshot.produced_at, snapshot.mid_price))
         cutoff = snapshot.produced_at - timedelta(seconds=self.settings.price_history_window_s)
         while history and history[0][0] < cutoff:
             history.popleft()
+        return True
 
     def _price_shock(self, snapshot: MarketSnapshot) -> ShockEvent | None:
         cutoff = snapshot.produced_at - timedelta(hours=1)
-        baselines = [point for point in self._price_history[snapshot.symbol] if point[0] <= cutoff]
+        earliest = cutoff - timedelta(seconds=self.settings.shock_baseline_tolerance_s)
+        baselines = [
+            point for point in self._price_history[snapshot.symbol] if earliest <= point[0] <= cutoff
+        ]
         if not baselines:
             return None
         _, baseline_price = baselines[-1]
@@ -300,7 +453,22 @@ class MacroService:
             log.warning("macro.symbol_rejected", symbol=snapshot.symbol)
             return
 
-        self._ingest_market(snapshot)
+        if not self._ingest_market(snapshot):
+            return
+        await self._recover_pending_schedule()
+        now = self._now()
+        if snapshot.produced_at > now:
+            return
+        if (
+            self._freshness_issue(
+                label="market snapshot",
+                observed_at=snapshot.produced_at,
+                reference=now,
+                ttl_s=self.settings.market_snapshot_max_age_s,
+            )
+            is not None
+        ):
+            return
         shock = self._price_shock(snapshot)
         if shock is None:
             return
@@ -375,14 +543,17 @@ class MacroService:
 
     async def _scheduler(self) -> None:  # pragma: no cover - wall-clock loop
         while True:
-            now = datetime.now(UTC)
+            now = self._now()
             schedule_key = f"schedule:{now.date().isoformat()}:{self.settings.run_cron_hour_utc:02d}"
             if (
                 now.hour == self.settings.run_cron_hour_utc
                 and now.minute == 0
                 and schedule_key != self._last_schedule_key
             ):
-                if self._latest_account is None and self.system_mode is SystemMode.NORMAL:
+                if (
+                    self.system_mode is not SystemMode.NORMAL
+                    or self._context_readiness_issue(now) is not None
+                ):
                     self._pending_schedule_key = schedule_key
                 await self.run_once(
                     StrategicTrigger.SCHEDULE,

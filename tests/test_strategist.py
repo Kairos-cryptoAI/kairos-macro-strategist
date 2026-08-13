@@ -78,3 +78,21 @@ async def test_extra_model_fields_are_rejected():
     allocation = await MacroStrategist(gateway).allocate("{}", trigger=StrategicTrigger.SCHEDULE)
 
     assert allocation.rationale.startswith("defensive fallback")
+
+
+async def test_unallocated_capital_triggers_defensive_fallback():
+    gateway = FakeGateway(
+        {
+            "regime": "CHOP",
+            "stable_reserve_pct": 0.5,
+            "strategy_weights": {"delta_neutral": 0.2},
+            "max_gross_leverage": 1,
+            "rationale": "leave the rest unspecified",
+        }
+    )
+
+    allocation = await MacroStrategist(gateway).allocate("{}", trigger=StrategicTrigger.SCHEDULE)
+
+    assert allocation.stable_reserve_pct == 0.6
+    assert allocation.strategy_weights == {"delta_neutral": 0.4}
+    assert allocation.rationale.startswith("defensive fallback")
