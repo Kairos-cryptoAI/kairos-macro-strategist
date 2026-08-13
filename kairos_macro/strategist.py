@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import Annotated, Any
 
 from kairos_core.contracts import StrategicAllocation
-from kairos_core.enums import MarketRegime, ReasoningEffort, StrategicTrigger
+from kairos_core.enums import MarketRegime, StrategicTrigger
+from kairos_llm import LLMWorkload
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .prompts import MACRO_SYSTEM
@@ -51,7 +52,7 @@ class MacroStrategist:
             result = await self.gateway.complete(
                 system=MACRO_SYSTEM,
                 user=context_json,
-                effort=ReasoningEffort.XHIGH,
+                workload=LLMWorkload.MACRO_STRATEGIST,
                 schema=AllocationOutput,
             )
             output = (

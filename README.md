@@ -1,7 +1,9 @@
 # kairos-macro-strategist
 
-**Layer 4 — Macro Strategist.** The slow strategic layer uses xhigh reasoning to
-set global capital allocation. It never creates individual exchange orders.
+**Layer 4 — Macro Strategist.** The slow strategic layer selects the explicit
+`MACRO_STRATEGIST` LLM workload for its xhigh capital-allocation analysis. Model
+and provider selection remain centralized in `kairos-llm`; this service never
+creates individual exchange orders.
 
 ## Real inputs and triggers
 
@@ -25,8 +27,8 @@ not fabricated from news text.
 - If the daily schedule fires before account reconciliation, the defensive allocation
   is followed by a separately identified context-recovery allocation as soon as a full
   account snapshot arrives in normal system mode.
-- `CONFLICT_SAFE` and `LOCAL_QUANT_MODE` bypass GPT and publish the same defensive
-  capital-preservation allocation immediately.
+- `CONFLICT_SAFE` and `LOCAL_QUANT_MODE` bypass the `MACRO_STRATEGIST` workload and
+  publish the same defensive capital-preservation allocation immediately.
 - Every trigger has a deterministic allocation message ID. Completed LLM output is
   cached by trigger so a failed publish retries the identical result.
 - Input messages are acknowledged only after validation and all required publishing.

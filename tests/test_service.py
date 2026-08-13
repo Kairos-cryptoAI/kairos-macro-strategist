@@ -19,6 +19,7 @@ from kairos_core.contracts import (
 )
 from kairos_core.enums import Side, StrategicTrigger, SystemMode
 from kairos_core.topics import Topics
+from kairos_llm import LLMWorkload
 
 from kairos_macro.config import MacroSettings
 from kairos_macro.service import MacroService
@@ -30,8 +31,8 @@ class _FakeGateway:
         self.calls: list[dict] = []
         self.closed = False
 
-    async def complete(self, *, system, user, effort, schema=None):
-        self.calls.append({"system": system, "user": user, "effort": effort, "schema": schema})
+    async def complete(self, *, system, user, workload, schema=None):
+        self.calls.append({"system": system, "user": user, "workload": workload, "schema": schema})
         return SimpleNamespace(
             parsed=AllocationOutput(
                 regime="BEAR",
@@ -184,6 +185,7 @@ async def test_run_once_uses_real_account_and_market_context():
     assert context["performance"]["sample_count"] == 1
     assert context["performance"]["full_window"] is False
     assert context["macro"]["markets"]["BTCUSDT"]["mid_price"] == 95
+    assert gateway.calls[0]["workload"] is LLMWorkload.MACRO_STRATEGIST
     assert gateway.calls[0]["schema"] is AllocationOutput
     assert allocation.message_id == "macro:schedule:2026-08-12:00"
     assert bus.published[0][0] == Topics.STRATEGIC_ALLOCATION

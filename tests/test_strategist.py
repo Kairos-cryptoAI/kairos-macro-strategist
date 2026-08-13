@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from kairos_core.enums import MarketRegime, StrategicTrigger
+from kairos_llm import LLMWorkload
 
 from kairos_macro.strategist import AllocationOutput, MacroStrategist
 
@@ -10,7 +11,8 @@ class FakeGateway:
         self.parsed = parsed
         self.schema = None
 
-    async def complete(self, *, system, user, effort, schema=None):
+    async def complete(self, *, system, user, workload, schema=None):
+        self.workload = workload
         self.schema = schema
         return SimpleNamespace(parsed=self.parsed)
 
@@ -34,6 +36,7 @@ async def test_parses_allocation_through_strict_schema():
     )
 
     assert gateway.schema is AllocationOutput
+    assert gateway.workload is LLMWorkload.MACRO_STRATEGIST
     assert allocation.regime is MarketRegime.BEAR
     assert allocation.stable_reserve_pct == 0.6
     assert allocation.triggered_by is StrategicTrigger.SHOCK_EVENT
