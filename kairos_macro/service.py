@@ -16,6 +16,7 @@ from kairos_core.contracts import AccountSnapshot, LLMHealthEvent, MarketSnapsho
 from kairos_core.enums import Side, StrategicTrigger, SystemMode
 from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
+from kairos_persistence import DurableMessageBus
 
 from .config import MacroSettings
 from .context import build_macro_context
@@ -35,7 +36,15 @@ class MacroService:
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.settings = settings or MacroSettings()
-        self.bus = bus if bus is not None else build_bus(self.settings)
+        if bus is not None:
+            self.bus = bus
+        else:
+            transport = build_bus(self.settings)
+            self.bus = (
+                transport
+                if self.settings.bus_backend == "memory"
+                else DurableMessageBus(transport, service_name=self.settings.service_name)
+            )
         self.detector = ShockDetector(self.settings.crash_pct_1h)
         if gateway is None:
             from kairos_llm import LLMGateway

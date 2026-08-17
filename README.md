@@ -74,6 +74,13 @@ uv build --no-sources
 CI runs the blocking suite on Linux with Python 3.11 and 3.14, plus Windows with
 Python 3.11.
 
+## Runtime delivery durability
+
+With Redis, consumed IDs, handler outputs and completion are committed through
+`kairos-persistence`; Redis is ACKed only after PostgreSQL commits. Configure
+`KAIROS_PERSISTENCE_DATABASE_URL` through the deployment secret provider. The
+in-memory backend intentionally bypasses persistence for local tests.
+
 ---
 
 Part of the [Kairos](https://github.com/Kairos-cryptoAI/kairos) system. MIT licensed.
