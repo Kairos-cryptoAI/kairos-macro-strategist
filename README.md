@@ -48,6 +48,10 @@ the exact counts/method are included as `regime_evidence`.
 - Input messages are acknowledged only after validation and all required publishing.
 - TaskGroup cancellation always closes both the LLM gateway and message bus.
 
+Sol calls reserve capacity in the shared PostgreSQL `kairos-llm-v1/openai`
+ledger before contacting OpenAI. Macro shares the same `$45` runtime ceiling as
+Aggregator; an in-memory runtime denies paid calls and falls back defensively.
+
 ## Local development
 
 Install [uv](https://docs.astral.sh/uv/) once. The repository pins uv 0.12.3,

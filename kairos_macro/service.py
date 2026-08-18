@@ -16,7 +16,7 @@ from kairos_core.contracts import AccountSnapshot, LLMHealthEvent, MarketSnapsho
 from kairos_core.enums import Side, StrategicTrigger, SystemMode
 from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
-from kairos_persistence import DurableMessageBus
+from kairos_persistence import DurableLLMUsageBudget, DurableMessageBus
 
 from .config import MacroSettings
 from .context import build_macro_context
@@ -47,9 +47,22 @@ class MacroService:
             )
         self.detector = ShockDetector(self.settings.crash_pct_1h)
         if gateway is None:
-            from kairos_llm import LLMGateway
+            from kairos_llm import (
+                BudgetedLLMGateway,
+                DenyLLMUsageBudget,
+                LLMGateway,
+                LLMSettings,
+            )
 
-            gateway = LLMGateway(on_health=self._publish_health)
+            budget = (
+                DurableLLMUsageBudget(self.bus)
+                if isinstance(self.bus, DurableMessageBus)
+                else DenyLLMUsageBudget()
+            )
+            gateway = BudgetedLLMGateway(
+                LLMGateway(settings=LLMSettings(max_retries=0), on_health=self._publish_health),
+                budget,
+            )
         self.strategist = MacroStrategist(gateway, source=self.settings.service_name)
         self._clock = clock or (lambda: datetime.now(UTC))
 

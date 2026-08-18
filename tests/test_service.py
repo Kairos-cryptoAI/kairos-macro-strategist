@@ -19,7 +19,8 @@ from kairos_core.contracts import (
 )
 from kairos_core.enums import Side, StrategicTrigger, SystemMode
 from kairos_core.topics import Topics
-from kairos_llm import LLMWorkload
+from kairos_llm import BudgetedLLMGateway, DenyLLMUsageBudget, LLMWorkload
+from kairos_persistence import DurableLLMUsageBudget
 
 from kairos_macro.config import MacroSettings
 from kairos_macro.service import MacroService
@@ -165,7 +166,14 @@ def _service(now: datetime | None = None) -> tuple[MacroService, _FakeGateway, _
 
 def test_gateway_health_hook_is_wired_for_production_gateway():
     service = MacroService(MacroSettings(bus_backend="memory"))
+    assert isinstance(service.strategist.gateway, BudgetedLLMGateway)
+    assert isinstance(service.strategist.gateway.budget, DenyLLMUsageBudget)
     assert service.strategist.gateway._on_health is not None
+
+
+def test_durable_runtime_wires_shared_provider_budget():
+    service = MacroService(MacroSettings(bus_backend="redis"))
+    assert isinstance(service.strategist.gateway.budget, DurableLLMUsageBudget)
 
 
 async def test_run_once_uses_real_account_and_market_context():
