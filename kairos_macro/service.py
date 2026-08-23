@@ -12,7 +12,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from kairos_core.bus import BusEnvelope, MessageBus, build_bus
-from kairos_core.contracts import AccountSnapshot, LLMHealthEvent, MarketSnapshot, StrategicAllocation
+from kairos_core.contracts import (
+    AccountSnapshot,
+    AccountSnapshotV2,
+    LLMHealthEvent,
+    MarketSnapshot,
+    StrategicAllocation,
+)
 from kairos_core.enums import Side, StrategicTrigger, SystemMode
 from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
@@ -52,6 +58,7 @@ class MacroService:
                 DenyLLMUsageBudget,
                 LLMGateway,
                 LLMSettings,
+                Provider,
             )
 
             budget = (
@@ -62,12 +69,16 @@ class MacroService:
             gateway = BudgetedLLMGateway(
                 LLMGateway(settings=LLMSettings(max_retries=0), on_health=self._publish_health),
                 budget,
+                monthly_budgets_microusd={
+                    Provider.OPENAI: 12_000_000,
+                    Provider.DEEPSEEK: 1_000_000,
+                },
             )
         self.strategist = MacroStrategist(gateway, source=self.settings.service_name)
         self._clock = clock or (lambda: datetime.now(UTC))
 
         self.system_mode = SystemMode.NORMAL
-        self._latest_account: AccountSnapshot | None = None
+        self._latest_account: AccountSnapshot | AccountSnapshotV2 | None = None
         self._latest_account_captured_at: datetime | None = None
         self._account_history: deque[tuple[datetime, float]] = deque()
         self._latest_markets: dict[str, MarketSnapshot] = {}
@@ -137,26 +148,42 @@ class MacroService:
         payload = json.dumps(snapshot.to_payload(), separators=(",", ":"), sort_keys=True)
         return hashlib.sha256(payload.encode()).hexdigest()
 
+    @staticmethod
+    def _account_captured_at(account: AccountSnapshot | AccountSnapshotV2) -> datetime:
+        return account.captured_at if isinstance(account, AccountSnapshot) else account.produced_at
+
+    @staticmethod
+    def _account_daily_pnl_pct(account: AccountSnapshot | AccountSnapshotV2) -> float:
+        if isinstance(account, AccountSnapshot):
+            return account.daily_pnl_pct
+        return ((account.equity_usd / account.durable_day_start_equity_usd) - 1.0) * 100.0
+
     def _portfolio_context(self, reference: datetime) -> dict[str, Any]:
         account = self._latest_account
         if account is None:
             raise RuntimeError("reconciled account context is unavailable")
-        return {
-            "message_id": account.message_id,
-            "source": account.source,
-            "exchange": account.exchange,
-            "account_id": account.account_id,
-            "equity_usd": account.equity_usd,
-            "available_balance_usd": account.available_balance_usd,
-            "liquid_pct": round(min(1.0, account.available_balance_usd / account.equity_usd), 6),
-            "margin_used_usd": account.margin_used_usd,
-            "peak_equity_usd": account.peak_equity_usd,
-            "daily_pnl_pct": account.daily_pnl_pct,
-            "realized_pnl_usd": account.realized_pnl_usd,
-            "unrealized_pnl_usd": account.unrealized_pnl_usd,
-            "captured_at": account.captured_at.isoformat(),
-            "age_s": round(max(0.0, (reference - account.captured_at).total_seconds()), 3),
-            "positions": [
+        captured_at = self._account_captured_at(account)
+        if isinstance(account, AccountSnapshotV2):
+            positions = [
+                {
+                    "symbol": position.venue_symbol,
+                    "signed_quantity": position.signed_quantity,
+                    "entry_price": position.entry_price,
+                    "mark_price": position.mark_price,
+                    "leverage": position.leverage,
+                    "liquidation_price": position.liquidation_price,
+                    "unrealized_pnl_usd": position.unrealized_pnl_usd,
+                    "protective_stop_order_id": position.stop_client_order_id,
+                    "strategy_id": position.strategy_id,
+                    "trade_id": position.trade_id,
+                    "lifecycle_state": position.lifecycle_state.value,
+                }
+                for position in account.positions
+            ]
+            peak_equity_usd = account.durable_peak_equity_usd
+            realized_pnl_usd = account.daily_realized_pnl_usd
+        else:
+            positions = [
                 position.model_dump(
                     mode="json",
                     include={
@@ -171,7 +198,25 @@ class MacroService:
                     },
                 )
                 for position in account.positions
-            ],
+            ]
+            peak_equity_usd = account.peak_equity_usd
+            realized_pnl_usd = account.realized_pnl_usd
+        return {
+            "message_id": account.message_id,
+            "source": account.source,
+            "exchange": account.exchange,
+            "account_id": account.account_id,
+            "equity_usd": account.equity_usd,
+            "available_balance_usd": account.available_balance_usd,
+            "liquid_pct": round(min(1.0, account.available_balance_usd / account.equity_usd), 6),
+            "margin_used_usd": account.margin_used_usd,
+            "peak_equity_usd": peak_equity_usd,
+            "daily_pnl_pct": self._account_daily_pnl_pct(account),
+            "realized_pnl_usd": realized_pnl_usd,
+            "unrealized_pnl_usd": account.unrealized_pnl_usd,
+            "captured_at": captured_at.isoformat(),
+            "age_s": round(max(0.0, (reference - captured_at).total_seconds()), 3),
+            "positions": positions,
         }
 
     def _performance_context(self) -> dict[str, Any]:
@@ -179,7 +224,8 @@ class MacroService:
         if account is None:
             raise RuntimeError("reconciled account context is unavailable")
         first_at, baseline = self._account_history[0]
-        observed_window_s = max(0.0, (account.captured_at - first_at).total_seconds())
+        captured_at = self._account_captured_at(account)
+        observed_window_s = max(0.0, (captured_at - first_at).total_seconds())
         observed_pnl_pct = ((account.equity_usd / baseline) - 1.0) * 100.0 if baseline > 0 else 0.0
         return {
             "observed_pnl_pct": round(observed_pnl_pct, 2),
@@ -187,7 +233,7 @@ class MacroService:
             "target_window_s": self.settings.account_history_window_s,
             "full_window": observed_window_s >= self.settings.account_history_window_s * 0.99,
             "sample_count": len(self._account_history),
-            "daily_pnl_pct": account.daily_pnl_pct,
+            "daily_pnl_pct": self._account_daily_pnl_pct(account),
         }
 
     def _fresh_markets(self, reference: datetime) -> dict[str, MarketSnapshot]:
@@ -295,11 +341,12 @@ class MacroService:
         account = self._latest_account
         if account is None:
             return "missing reconciled account context"
-        if account.captured_at > reference:
+        captured_at = self._account_captured_at(account)
+        if captured_at > reference:
             return "account snapshot postdates the allocation evaluation time"
         issue = self._freshness_issue(
             label="account snapshot",
-            observed_at=account.captured_at,
+            observed_at=captured_at,
             reference=reference,
             ttl_s=self.settings.account_snapshot_max_age_s,
         )
@@ -368,33 +415,38 @@ class MacroService:
             return allocation
 
     def _ingest_account(self, envelope: BusEnvelope) -> None:
-        account = AccountSnapshot.model_validate(envelope.payload)
-        self._require_aware(account.captured_at, field="account snapshot captured_at")
+        account: AccountSnapshot | AccountSnapshotV2
+        if envelope.topic == Topics.ACCOUNT_SNAPSHOT_V2:
+            account = AccountSnapshotV2.model_validate(envelope.payload)
+        else:
+            account = AccountSnapshot.model_validate(envelope.payload)
+        captured_at = self._account_captured_at(account)
+        self._require_aware(captured_at, field="account snapshot captured_at")
         future_issue = self._freshness_issue(
             label="account snapshot",
-            observed_at=account.captured_at,
+            observed_at=captured_at,
             reference=self._now(),
             ttl_s=float("inf"),
         )
         if future_issue is not None:
             raise ValueError(future_issue)
         latest_at = self._latest_account_captured_at
-        if latest_at is not None and account.captured_at < latest_at:
+        if latest_at is not None and captured_at < latest_at:
             return
-        if latest_at is not None and account.captured_at == latest_at:
+        if latest_at is not None and captured_at == latest_at:
             if not account.reconciled:
                 self._latest_account = None
             return
 
-        self._latest_account_captured_at = account.captured_at
+        self._latest_account_captured_at = captured_at
         if not account.reconciled:
             self._latest_account = None
             log.warning("macro.account_unreconciled", account_id=account.account_id)
             return
 
         self._latest_account = account
-        self._account_history.append((account.captured_at, account.equity_usd))
-        cutoff = account.captured_at - timedelta(seconds=self.settings.account_history_window_s)
+        self._account_history.append((captured_at, account.equity_usd))
+        cutoff = captured_at - timedelta(seconds=self.settings.account_history_window_s)
         while self._account_history and self._account_history[0][0] < cutoff:
             self._account_history.popleft()
 
@@ -406,6 +458,19 @@ class MacroService:
                 await self.bus.ack(Topics.ACCOUNT_SNAPSHOT, envelope, group="macro")
             except Exception:
                 log.exception("macro.account_processing_failed", envelope_id=envelope.id)
+
+    async def _consume_accounts_v2(self) -> None:
+        async for envelope in self.bus.subscribe(
+            Topics.ACCOUNT_SNAPSHOT_V2,
+            group="macro-v2",
+            consumer="accounts-v2",
+        ):
+            try:
+                self._ingest_account(envelope)
+                await self._recover_pending_schedule()
+                await self.bus.ack(Topics.ACCOUNT_SNAPSHOT_V2, envelope, group="macro-v2")
+            except Exception:
+                log.exception("macro.account_v2_processing_failed", envelope_id=envelope.id)
 
     async def _recover_pending_schedule(self) -> None:
         schedule_key = self._pending_schedule_key
@@ -606,6 +671,7 @@ class MacroService:
             async with asyncio.TaskGroup() as tasks:
                 tasks.create_task(self._scheduler(), name="schedule")
                 tasks.create_task(self._consume_accounts(), name="account-snapshots")
+                tasks.create_task(self._consume_accounts_v2(), name="account-snapshots-v2")
                 tasks.create_task(self._consume_markets(), name="market-snapshots")
                 tasks.create_task(self._consume_control(), name="system-control")
         finally:

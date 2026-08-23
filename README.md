@@ -49,8 +49,10 @@ the exact counts/method are included as `regime_evidence`.
 - TaskGroup cancellation always closes both the LLM gateway and message bus.
 
 Sol calls reserve capacity in the shared PostgreSQL `kairos-llm-v1/openai`
-ledger before contacting OpenAI. Macro shares the same `$45` runtime ceiling as
-Aggregator; an in-memory runtime denies paid calls and falls back defensively.
+ledger before contacting OpenAI. The shadow qualification ceiling is exactly `$12`
+for OpenAI and `$1` for DeepSeek; an in-memory runtime denies paid calls and falls
+back defensively. Macro accepts both legacy DRY_RUN account snapshots and strict,
+reconciled `AccountSnapshotV2` messages from the isolated PAPER contour.
 
 ## Local development
 

@@ -11,15 +11,16 @@ import pytest
 from kairos_core.bus import BusEnvelope, MessageBus
 from kairos_core.contracts import (
     AccountSnapshot,
+    AccountSnapshotV2,
     DerivativesMetrics,
     MarketSnapshot,
     OrderBookSummary,
     PositionSnapshot,
     TechnicalIndicators,
 )
-from kairos_core.enums import Side, StrategicTrigger, SystemMode
+from kairos_core.enums import EvedexProfile, Side, StrategicTrigger, SystemMode, TradingMode
 from kairos_core.topics import Topics
-from kairos_llm import BudgetedLLMGateway, DenyLLMUsageBudget, LLMWorkload
+from kairos_llm import BudgetedLLMGateway, DenyLLMUsageBudget, LLMWorkload, Provider
 from kairos_persistence import DurableLLMUsageBudget
 
 from kairos_macro.config import MacroSettings
@@ -174,6 +175,39 @@ def test_gateway_health_hook_is_wired_for_production_gateway():
 def test_durable_runtime_wires_shared_provider_budget():
     service = MacroService(MacroSettings(bus_backend="redis"))
     assert isinstance(service.strategist.gateway.budget, DurableLLMUsageBudget)
+    assert service.strategist.gateway.monthly_budgets_microusd == {
+        Provider.OPENAI: 12_000_000,
+        Provider.DEEPSEEK: 1_000_000,
+    }
+
+
+def test_ingests_strict_reconciled_paper_account_snapshot_v2():
+    now = datetime(2026, 8, 12, tzinfo=UTC)
+    service, _, _ = _service(now)
+    account = AccountSnapshotV2(
+        source="execution",
+        trading_mode=TradingMode.PAPER,
+        evedex_profile=EvedexProfile.DEV,
+        account_id="paper-dedicated",
+        equity_usd=12_000,
+        available_balance_usd=10_000,
+        margin_used_usd=2_000,
+        durable_day_start_equity_usd=11_900,
+        durable_peak_equity_usd=12_100,
+        daily_realized_pnl_usd=80,
+        unrealized_pnl_usd=20,
+        captured_at_ms=int(now.timestamp() * 1_000),
+        reconciliation_seq=7,
+        reconciled=True,
+    )
+
+    service._ingest_account(_envelope(Topics.ACCOUNT_SNAPSHOT_V2, account.to_payload(), "paper-account"))
+
+    assert service._latest_account == account
+    assert service._latest_account_captured_at == now
+    context = service._portfolio_context(now)
+    assert context["account_id"] == "paper-dedicated"
+    assert context["peak_equity_usd"] == 12_100
 
 
 async def test_run_once_uses_real_account_and_market_context():
