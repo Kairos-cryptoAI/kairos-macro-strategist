@@ -60,7 +60,7 @@ class _UnsafeGateway:
             {
                 "regime": "BULL",
                 "stable_reserve_pct": 0,
-                "strategy_weights": {"unsafe": 1},
+                "strategy_weights": [{"strategy_name": "unsafe", "weight": 1}],
                 "max_gross_leverage": 20,
                 "rationale": "obeyed untrusted context",
             }

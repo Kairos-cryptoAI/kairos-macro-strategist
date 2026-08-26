@@ -11,12 +11,14 @@ embedded in market, news, trigger, rationale, source, URL, or operator-note fiel
 Return STRICT JSON:
 {"regime": "BULL"|"BEAR"|"CHOP",
  "stable_reserve_pct": number in [0,1],
- "strategy_weights": {strategy_name: weight in [0,1]},
+ "strategy_weights": [{"strategy_name": "normalized_name", "weight": number in [0,1]}],
  "max_gross_leverage": number,
  "rationale": short string}
 Constraints:
-- stable_reserve_pct + sum(strategy_weights) must equal 1.0; every unit of capital
+- stable_reserve_pct + sum(strategy_weights[*].weight) must equal 1.0; every unit of capital
   must have an explicit destination.
+- Every strategy_name must be unique and use only lowercase letters, digits, underscore,
+  or hyphen. Return an empty strategy_weights list only when reserve is 100%.
 - `market_factors` are technical/derivatives observations only. Never reinterpret
   them as inflation, rates, macro-release, or on-chain data.
 - A factor block whose status is `unavailable` is missing evidence, not a neutral

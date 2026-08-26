@@ -22,7 +22,7 @@ async def test_parses_allocation_through_strict_schema():
         {
             "regime": "BEAR",
             "stable_reserve_pct": 0.6,
-            "strategy_weights": {"delta_neutral": 0.4},
+            "strategy_weights": [{"strategy_name": "delta_neutral", "weight": 0.4}],
             "max_gross_leverage": 1.5,
             "rationale": "risk off",
         }
@@ -49,7 +49,7 @@ async def test_invalid_weights_trigger_defensive_fallback():
         {
             "regime": "BULL",
             "stable_reserve_pct": 0.8,
-            "strategy_weights": {"grid": 0.5},
+            "strategy_weights": [{"strategy_name": "grid", "weight": 0.5}],
             "max_gross_leverage": 3,
         }
     )
@@ -68,7 +68,7 @@ async def test_extra_model_fields_are_rejected():
         {
             "regime": "CHOP",
             "stable_reserve_pct": 0.5,
-            "strategy_weights": {"delta_neutral": 0.5},
+            "strategy_weights": [{"strategy_name": "delta_neutral", "weight": 0.5}],
             "max_gross_leverage": 1,
             "rationale": "safe",
             "unexpected": "not allowed",
@@ -85,7 +85,7 @@ async def test_unallocated_capital_triggers_defensive_fallback():
         {
             "regime": "CHOP",
             "stable_reserve_pct": 0.5,
-            "strategy_weights": {"delta_neutral": 0.2},
+            "strategy_weights": [{"strategy_name": "delta_neutral", "weight": 0.2}],
             "max_gross_leverage": 1,
             "rationale": "leave the rest unspecified",
         }
@@ -96,3 +96,14 @@ async def test_unallocated_capital_triggers_defensive_fallback():
     assert allocation.stable_reserve_pct == 0.6
     assert allocation.strategy_weights == {"delta_neutral": 0.4}
     assert allocation.rationale.startswith("defensive fallback")
+
+
+def test_provider_schema_has_fixed_strategy_weight_items() -> None:
+    schema = AllocationOutput.model_json_schema()
+    weights = schema["properties"]["strategy_weights"]
+
+    assert weights["type"] == "array"
+    assert weights["items"]["$ref"].endswith("/$defs/StrategyWeightOutput")
+    item = schema["$defs"]["StrategyWeightOutput"]
+    assert item["additionalProperties"] is False
+    assert set(item["required"]) == {"strategy_name", "weight"}

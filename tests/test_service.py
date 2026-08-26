@@ -39,7 +39,7 @@ class _FakeGateway:
             parsed=AllocationOutput(
                 regime="BEAR",
                 stable_reserve_pct=0.5,
-                strategy_weights={"delta_neutral": 0.5},
+                strategy_weights=[{"strategy_name": "delta_neutral", "weight": 0.5}],
                 max_gross_leverage=1.2,
                 rationale="real context",
             )

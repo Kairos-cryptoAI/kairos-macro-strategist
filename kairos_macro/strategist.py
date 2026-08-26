@@ -14,6 +14,15 @@ from .prompts import MACRO_SYSTEM
 Weight = Annotated[float, Field(ge=0.0, le=1.0)]
 
 
+class StrategyWeightOutput(BaseModel):
+    """One fixed-shape allocation item accepted by OpenAI Structured Outputs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_name: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    weight: Weight
+
+
 class AllocationOutput(BaseModel):
     """Provider-neutral Structured Outputs schema for the Macro call."""
 
@@ -21,18 +30,24 @@ class AllocationOutput(BaseModel):
 
     regime: MarketRegime
     stable_reserve_pct: float = Field(ge=0.0, le=1.0)
-    strategy_weights: dict[str, Weight] = Field(default_factory=dict)
+    strategy_weights: tuple[StrategyWeightOutput, ...] = Field(..., max_length=64)
     max_gross_leverage: float = Field(gt=0.0, le=20.0)
-    rationale: str = Field(default="", max_length=400)
+    rationale: str = Field(..., max_length=400)
 
     @model_validator(mode="after")
     def validate_total_allocation(self) -> AllocationOutput:
-        total = self.stable_reserve_pct + sum(self.strategy_weights.values())
+        total = self.stable_reserve_pct + sum(item.weight for item in self.strategy_weights)
         if not 0.9999 <= total <= 1.0001:
             raise ValueError(f"total allocation must equal 1.0: {total:.4f}")
-        if any(not name or name != name.strip() for name in self.strategy_weights):
-            raise ValueError("strategy names must be non-empty and whitespace-normalized")
+        names = [item.strategy_name for item in self.strategy_weights]
+        if len(names) != len(set(names)):
+            raise ValueError("strategy names must be unique")
         return self
+
+    def strategy_weight_map(self) -> dict[str, float]:
+        """Convert the provider-safe list into the canonical domain mapping."""
+
+        return {item.strategy_name: item.weight for item in self.strategy_weights}
 
 
 class MacroStrategist:
@@ -67,7 +82,7 @@ class MacroStrategist:
                 source=self.source,
                 regime=output.regime,
                 stable_reserve_pct=output.stable_reserve_pct,
-                strategy_weights=output.strategy_weights,
+                strategy_weights=output.strategy_weight_map(),
                 max_gross_leverage=output.max_gross_leverage,
                 triggered_by=trigger,
                 rationale=output.rationale,
