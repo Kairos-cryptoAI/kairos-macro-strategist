@@ -39,6 +39,21 @@ async def test_packaged_macro_corpus_passes_network_free_harness() -> None:
     assert all(item.allocation_total == pytest.approx(1.0) for item in report.observations)
 
 
+async def test_targeted_case_replay_does_not_recall_passed_states() -> None:
+    corpus, digest = load_corpus()
+    report = await qualify_macro_corpus(
+        corpus,
+        _ScriptedGateway(),
+        mode="STATIC_HARNESS",
+        corpus_sha256=digest,
+        maximum_planned_cost_usd=0.25,
+        selected_case_ids=("bear_shock_drawdown",),
+    )
+    assert [item.case_id for item in report.observations] == ["bear_shock_drawdown"]
+    with pytest.raises(ValueError, match="unknown corpus case"):
+        planned_cost_ceiling_usd(corpus, ("unknown",))
+
+
 class _UnsafeGateway:
     async def complete(self, **_kwargs) -> LLMResult:
         parsed = AllocationOutput.model_validate(

@@ -44,7 +44,7 @@ from .strategist import AllocationOutput, MacroStrategist
 DEFAULT_CORPUS_RESOURCE = "macro_states_v1.json"
 DEFAULT_MAXIMUM_PLANNED_COST_USD = 0.25
 HARD_MAXIMUM_PLANNED_COST_USD = 0.50
-QUALIFICATION_MAX_OUTPUT_TOKENS = 512
+QUALIFICATION_MAX_OUTPUT_TOKENS = 1_024
 MAXIMUM_CASE_LATENCY_S = 60.0
 
 
@@ -97,6 +97,7 @@ class CaseObservation:
     model: str | None
     latency_ms: int | None
     cost_usd: float
+    failure_kind: str | None
     reasons: tuple[str, ...]
 
 
@@ -132,17 +133,20 @@ class _ObservedGateway:
         self.gateway = gateway
         self.results: list[LLMResult | None] = []
         self.schema_valid: list[bool] = []
+        self.failure_kinds: list[str | None] = []
 
     async def complete(self, **kwargs: Any) -> LLMResult:
         try:
             result = await self.gateway.complete(**kwargs)
             AllocationOutput.model_validate(result.parsed)
-        except Exception:
+        except Exception as exc:
             self.results.append(None)
             self.schema_valid.append(False)
+            self.failure_kinds.append(type(exc).__name__)
             raise
         self.results.append(result)
         self.schema_valid.append(True)
+        self.failure_kinds.append(None)
         return result
 
 
@@ -212,12 +216,13 @@ async def qualify_macro_corpus(
     corpus_sha256: str,
     planned_cost_ceiling_usd: float = 0.0,
     maximum_planned_cost_usd: float = 0.0,
+    selected_case_ids: Sequence[str] | None = None,
 ) -> MacroQualificationReport:
     observed = _ObservedGateway(gateway)
     strategist = MacroStrategist(observed, source="macro-strategist:qualification")
     observations: list[CaseObservation] = []
 
-    for case in corpus.cases:
+    for case in _select_cases(corpus, selected_case_ids):
         before = len(observed.results)
         started = time.monotonic()
         allocation = await strategist.allocate(
@@ -229,6 +234,7 @@ async def qualify_macro_corpus(
         called = len(observed.results) == before + 1
         result = observed.results[-1] if called else None
         schema_valid = observed.schema_valid[-1] if called else False
+        failure_kind = observed.failure_kinds[-1] if called else None
         total = allocation.stable_reserve_pct + sum(allocation.strategy_weights.values())
         reasons: list[str] = []
         if not called:
@@ -271,6 +277,7 @@ async def qualify_macro_corpus(
                 model=(result.resolved_model or result.model) if result is not None else None,
                 latency_ms=math.ceil(result.latency_s * 1_000) if result is not None else None,
                 cost_usd=result.cost_usd if result is not None else 0.0,
+                failure_kind=failure_kind,
                 reasons=tuple(reasons),
             )
         )
@@ -292,6 +299,7 @@ async def qualify_macro_corpus(
                 model=None,
                 latency_ms=None,
                 cost_usd=0.0,
+                failure_kind=None,
                 reasons=("actual_cost_exceeded_planned_ceiling",),
             )
         )
@@ -312,7 +320,24 @@ async def qualify_macro_corpus(
     )
 
 
-def planned_cost_ceiling_usd(corpus: MacroCorpus) -> float:
+def _select_cases(
+    corpus: MacroCorpus,
+    selected_case_ids: Sequence[str] | None,
+) -> tuple[MacroCorpusCase, ...]:
+    if not selected_case_ids:
+        return corpus.cases
+    requested = tuple(dict.fromkeys(selected_case_ids))
+    by_id = {item.case_id: item for item in corpus.cases}
+    unknown = sorted(set(requested) - set(by_id))
+    if unknown:
+        raise ValueError(f"unknown corpus case IDs: {', '.join(unknown)}")
+    return tuple(by_id[item] for item in requested)
+
+
+def planned_cost_ceiling_usd(
+    corpus: MacroCorpus,
+    selected_case_ids: Sequence[str] | None = None,
+) -> float:
     prices = PriceTable()
     return math.fsum(
         prices.cost(
@@ -326,7 +351,7 @@ def planned_cost_ceiling_usd(corpus: MacroCorpus) -> float:
                 output_tokens=QUALIFICATION_MAX_OUTPUT_TOKENS,
             ),
         )
-        for case in corpus.cases
+        for case in _select_cases(corpus, selected_case_ids)
     )
 
 
@@ -387,6 +412,7 @@ async def _live_gateway(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--corpus", type=Path)
+    parser.add_argument("--case", action="append", dest="case_ids")
     parser.add_argument("--static", action="store_true")
     parser.add_argument("--openai-key-file", type=Path)
     parser.add_argument("--redis-url-file", type=Path)
@@ -403,7 +429,7 @@ def _parser() -> argparse.ArgumentParser:
 
 async def _run(args: argparse.Namespace) -> MacroQualificationReport:
     corpus, digest = load_corpus(args.corpus)
-    planned = planned_cost_ceiling_usd(corpus)
+    planned = planned_cost_ceiling_usd(corpus, args.case_ids)
     maximum = float(args.maximum_planned_cost_usd)
     if not math.isfinite(maximum) or maximum <= 0 or maximum > HARD_MAXIMUM_PLANNED_COST_USD:
         raise ValueError(f"maximum planned cost must be in (0, {HARD_MAXIMUM_PLANNED_COST_USD}] USD")
@@ -416,6 +442,7 @@ async def _run(args: argparse.Namespace) -> MacroQualificationReport:
             mode="STATIC_HARNESS",
             corpus_sha256=digest,
             maximum_planned_cost_usd=maximum,
+            selected_case_ids=args.case_ids,
         )
     if not all((args.openai_key_file, args.redis_url_file, args.database_url_file)):
         raise ValueError("live qualification requires OpenAI, Redis and database secret files")
@@ -434,6 +461,7 @@ async def _run(args: argparse.Namespace) -> MacroQualificationReport:
             corpus_sha256=digest,
             planned_cost_ceiling_usd=planned,
             maximum_planned_cost_usd=maximum,
+            selected_case_ids=args.case_ids,
         )
     finally:
         await gateway.close()

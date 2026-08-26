@@ -71,6 +71,9 @@ The network-free mode validates the harness without cost. A live run takes OpenA
 Redis and PostgreSQL one-value secret files, reserves every Sol call in the shared
 durable `kairos-llm-v1/openai` ledger and refuses a planned run above `$0.25` by
 default (hard maximum `$0.50`). Every report sets `live_orders_allowed=false`.
+Use repeatable `--case CASE_ID` selectors after a failure so passed Sol cases are
+not recalled. The qualification envelope reserves up to 1024 output tokens for
+xhigh reasoning and commits only the provider-reported actual cost.
 
 ## Local development
 
