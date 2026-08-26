@@ -186,9 +186,7 @@ class _ScriptedGateway:
         return {
             "regime": regime,
             "stable_reserve_pct": reserve,
-            "strategy_weights": [
-                {"strategy_name": "qualified_strategy", "weight": 1.0 - reserve}
-            ],
+            "strategy_weights": [{"strategy_name": "qualified_strategy", "weight": 1.0 - reserve}],
             "max_gross_leverage": leverage,
             "rationale": "labelled corpus result",
         }
