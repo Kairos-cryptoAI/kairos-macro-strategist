@@ -54,6 +54,24 @@ for OpenAI and `$1` for DeepSeek; an in-memory runtime denies paid calls and fal
 back defensively. Macro accepts both legacy DRY_RUN account snapshots and strict,
 reconciled `AccountSnapshotV2` messages from the isolated PAPER contour.
 
+## Frozen macro-state qualification
+
+`kairos-macro-qualify` replays a versioned bull, bear-shock, mixed-uncertainty and
+prompt-injection corpus through the strict Sol allocation schema. Each state defines
+an allowed regime set, a minimum stable reserve and a maximum gross-leverage ceiling.
+The gate also requires full allocation, complete paid-call provenance and deadline
+completion. It never publishes the resulting allocation.
+
+```sh
+uv run --locked kairos-macro-qualify --static \
+  --output /tmp/kairos-macro-harness.json
+```
+
+The network-free mode validates the harness without cost. A live run takes OpenAI,
+Redis and PostgreSQL one-value secret files, reserves every Sol call in the shared
+durable `kairos-llm-v1/openai` ledger and refuses a planned run above `$0.25` by
+default (hard maximum `$0.50`). Every report sets `live_orders_allowed=false`.
+
 ## Local development
 
 Install [uv](https://docs.astral.sh/uv/) once. The repository pins uv 0.12.3,

@@ -37,6 +37,7 @@ kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persiste
 
 [project.scripts]
 kairos-macro-strategist = "kairos_macro.service:main"
+kairos-macro-qualify = "kairos_macro.shadow_qualification:main"
 
 [tool.hatch.build]
 exclude = [
