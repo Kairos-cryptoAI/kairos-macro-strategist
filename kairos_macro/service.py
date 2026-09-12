@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
-import json
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -26,6 +25,7 @@ from kairos_persistence import DurableLLMUsageBudget, DurableMessageBus
 
 from .config import MacroSettings
 from .context import build_macro_context
+from .history import AuditFact, load_audit_history, load_prior_allocation, payload_digest_text, timestamp
 from .strategist import MacroStrategist
 from .triggers import ShockDetector, ShockEvent
 
@@ -74,7 +74,11 @@ class MacroService:
                     Provider.DEEPSEEK: 1_000_000,
                 },
             )
-        self.strategist = MacroStrategist(gateway, source=self.settings.service_name)
+        self.strategist = MacroStrategist(
+            gateway,
+            source=self.settings.service_name,
+            allowed_strategy_ids=self.settings.allowed_strategy_ids,
+        )
         self._clock = clock or (lambda: datetime.now(UTC))
 
         self.system_mode = SystemMode.NORMAL
@@ -88,6 +92,22 @@ class MacroService:
         self._handled_market_ids: OrderedDict[str, None] = OrderedDict()
         self._handled_control_ids: OrderedDict[str, None] = OrderedDict()
         self._ingested_market_ids: OrderedDict[str, str] = OrderedDict()
+        self._ingested_account_ids: OrderedDict[str, str] = OrderedDict()
+        self._account_scope: tuple[str, ...] | None = None
+        self._latest_account_digest: str | None = None
+        self._latest_control_at: datetime | None = None
+        self._latest_control_digest: str | None = None
+        self._integrity_issue: str | None = None
+        self._history_restored = not isinstance(self.bus, DurableMessageBus)
+        self.history_status: dict[str, Any] = {
+            "state": "memory_only" if self._history_restored else "pending",
+            "restored_rows": 0,
+            "account_gaps": 0,
+            "market_gaps": 0,
+            "account_reorders": 0,
+            "market_reorders": 0,
+            "sample_evictions": 0,
+        }
         self._allocation_lock = asyncio.Lock()
         self._last_schedule_key: str | None = None
         self._pending_schedule_key: str | None = None
@@ -145,12 +165,40 @@ class MacroService:
 
     @staticmethod
     def _market_digest(snapshot: MarketSnapshot) -> str:
-        payload = json.dumps(snapshot.to_payload(), separators=(",", ":"), sort_keys=True)
+        payload = payload_digest_text(snapshot.to_payload())
         return hashlib.sha256(payload.encode()).hexdigest()
 
     @staticmethod
     def _account_captured_at(account: AccountSnapshot | AccountSnapshotV2) -> datetime:
-        return account.captured_at if isinstance(account, AccountSnapshot) else account.produced_at
+        return (
+            account.captured_at
+            if isinstance(account, AccountSnapshot)
+            else datetime.fromtimestamp(account.captured_at_ms / 1_000, UTC)
+        )
+
+    def _reject_integrity(self, detail: str) -> None:
+        self._integrity_issue = detail
+        raise ValueError(detail)
+
+    def _append_history(
+        self,
+        history: deque[tuple[datetime, float]],
+        point: tuple[datetime, float],
+        *,
+        window_s: float,
+        gap_s: float,
+        label: str,
+    ) -> None:
+        if history and (point[0] - history[-1][0]).total_seconds() > gap_s:
+            history.clear()
+            self.history_status[f"{label}_gaps"] += 1
+        history.append(point)
+        cutoff = point[0] - timedelta(seconds=window_s)
+        while history and history[0][0] < cutoff:
+            history.popleft()
+        while len(history) > self.settings.history_sample_limit:
+            history.popleft()
+            self.history_status["sample_evictions"] += 1
 
     @staticmethod
     def _account_daily_pnl_pct(account: AccountSnapshot | AccountSnapshotV2) -> float:
@@ -233,6 +281,7 @@ class MacroService:
             "target_window_s": self.settings.account_history_window_s,
             "full_window": observed_window_s >= self.settings.account_history_window_s * 0.99,
             "sample_count": len(self._account_history),
+            "history_integrity": dict(self.history_status),
             "daily_pnl_pct": self._account_daily_pnl_pct(account),
         }
 
@@ -338,6 +387,10 @@ class MacroService:
         )
 
     def _context_readiness_issue(self, reference: datetime) -> str | None:
+        if not self._history_restored:
+            return "durable history restoration has not completed"
+        if self._integrity_issue is not None:
+            return f"history integrity failure: {self._integrity_issue}"
         account = self._latest_account
         if account is None:
             return "missing reconciled account context"
@@ -371,7 +424,15 @@ class MacroService:
     ) -> StrategicAllocation:
         """Create and publish one replay-stable allocation for ``trigger_id``."""
         async with self._allocation_lock:
+            if not self._history_restored:
+                raise RuntimeError("durable history restoration has not completed")
             allocation = self._allocation_cache.get(trigger_id)
+            if allocation is None and isinstance(self.bus, DurableMessageBus) and self._history_restored:
+                fact = await load_prior_allocation(self.bus.database.pool, f"macro:{trigger_id}", self._now())
+                if fact is not None:
+                    allocation = self._allocation_fact(fact)
+            if allocation is not None:
+                self._validate_replayed_allocation(allocation)
             if allocation is None:
                 message_id = f"macro:{trigger_id}"
                 correlation_id = correlation_id or trigger_id
@@ -420,6 +481,17 @@ class MacroService:
             account = AccountSnapshotV2.model_validate(envelope.payload)
         else:
             account = AccountSnapshot.model_validate(envelope.payload)
+        version = "v2" if isinstance(account, AccountSnapshotV2) else "legacy"
+        if self.settings.account_history_version not in {
+            None,
+            version,
+        } or self.settings.account_history_account_id not in {None, account.account_id}:
+            return
+        scope: tuple[str, ...] = (version, account.exchange, account.account_id)
+        if isinstance(account, AccountSnapshotV2):
+            scope += (account.trading_mode.value, account.evedex_profile.value)
+        if self._account_scope is not None and scope != self._account_scope:
+            self._reject_integrity("account history contains mixed account/environment/version scopes")
         captured_at = self._account_captured_at(account)
         self._require_aware(captured_at, field="account snapshot captured_at")
         future_issue = self._freshness_issue(
@@ -430,25 +502,39 @@ class MacroService:
         )
         if future_issue is not None:
             raise ValueError(future_issue)
+        digest = payload_digest_text(account.to_payload())
+        prior_digest = self._ingested_account_ids.get(account.message_id)
+        if prior_digest is not None:
+            if prior_digest != digest:
+                self._reject_integrity("account snapshot message_id was reused")
+            return
         latest_at = self._latest_account_captured_at
         if latest_at is not None and captured_at < latest_at:
+            self.history_status["account_reorders"] += 1
             return
         if latest_at is not None and captured_at == latest_at:
-            if not account.reconciled:
-                self._latest_account = None
+            if digest != self._latest_account_digest:
+                self._reject_integrity("conflicting account snapshots at the same captured_at")
             return
 
+        self._account_scope = scope
+        self._remember(self._ingested_account_ids, account.message_id, digest)
+        self._latest_account_digest = digest
         self._latest_account_captured_at = captured_at
         if not account.reconciled:
             self._latest_account = None
+            self._account_history.clear()
             log.warning("macro.account_unreconciled", account_id=account.account_id)
             return
 
         self._latest_account = account
-        self._account_history.append((captured_at, account.equity_usd))
-        cutoff = captured_at - timedelta(seconds=self.settings.account_history_window_s)
-        while self._account_history and self._account_history[0][0] < cutoff:
-            self._account_history.popleft()
+        self._append_history(
+            self._account_history,
+            (captured_at, account.equity_usd),
+            window_s=self.settings.account_history_window_s,
+            gap_s=self.settings.account_history_max_gap_s,
+            label="account",
+        )
 
     async def _consume_accounts(self) -> None:
         async for envelope in self.bus.subscribe(Topics.ACCOUNT_SNAPSHOT, group="macro", consumer="accounts"):
@@ -505,7 +591,7 @@ class MacroService:
         prior_digest = self._ingested_market_ids.get(snapshot.message_id)
         if prior_digest is not None:
             if prior_digest != digest:
-                raise ValueError(f"market snapshot message_id {snapshot.message_id!r} was reused")
+                self._reject_integrity(f"market snapshot message_id {snapshot.message_id!r} was reused")
             # Exact replay remains eligible so an allocation cached before a
             # failed publish can be delivered without rerunning the model.
             return True
@@ -513,13 +599,21 @@ class MacroService:
 
         current = self._latest_markets.get(snapshot.symbol)
         if current is not None and snapshot.produced_at < current.produced_at:
+            self.history_status["market_reorders"] += 1
             return False
+        if current is not None and snapshot.produced_at == current.produced_at:
+            if self._market_digest(current) != digest:
+                self._reject_integrity("conflicting market snapshots at the same produced_at")
+            return True
         self._latest_markets[snapshot.symbol] = snapshot
         history = self._price_history[snapshot.symbol]
-        history.append((snapshot.produced_at, snapshot.mid_price))
-        cutoff = snapshot.produced_at - timedelta(seconds=self.settings.price_history_window_s)
-        while history and history[0][0] < cutoff:
-            history.popleft()
+        self._append_history(
+            history,
+            (snapshot.produced_at, snapshot.mid_price),
+            window_s=self.settings.price_history_window_s,
+            gap_s=self.settings.market_history_max_gap_s,
+            label="market",
+        )
         return True
 
     def _price_shock(self, snapshot: MarketSnapshot) -> ShockEvent | None:
@@ -590,18 +684,9 @@ class MacroService:
                 log.exception("macro.market_processing_failed", envelope_id=envelope.id)
 
     async def _process_control(self, envelope: BusEnvelope) -> None:
-        raw_mode = envelope.payload.get("mode")
-        if not isinstance(raw_mode, str):
-            raise ValueError(f"invalid system mode: {raw_mode!r}")
-        try:
-            mode = SystemMode(raw_mode)
-        except ValueError as exc:
-            raise ValueError(f"invalid system mode: {raw_mode!r}") from exc
-
-        previous = self.system_mode
-        self.system_mode = mode
-        if mode is not previous:
-            log.warning("macro.mode_change", previous=previous.value, mode=mode.value)
+        if not self._ingest_control(envelope.payload):
+            return
+        mode = self.system_mode
         if mode in {SystemMode.CONFLICT_SAFE, SystemMode.LOCAL_QUANT_MODE}:
             upstream_id = envelope.payload.get("message_id")
             causation_id = upstream_id if isinstance(upstream_id, str) else envelope.id
@@ -614,6 +699,31 @@ class MacroService:
             )
         elif mode is SystemMode.NORMAL:
             await self._recover_pending_schedule()
+
+    def _ingest_control(self, payload: dict[str, Any]) -> bool:
+        raw_mode = payload.get("mode")
+        if not isinstance(raw_mode, str):
+            raise ValueError(f"invalid system mode: {raw_mode!r}")
+        try:
+            mode = SystemMode(raw_mode)
+        except ValueError as exc:
+            raise ValueError(f"invalid system mode: {raw_mode!r}") from exc
+        observed_at = timestamp(payload.get("produced_at", self._now()))
+        if observed_at > self._now():
+            raise ValueError("system control postdates evaluation time")
+        digest = payload_digest_text(payload)
+        if self._latest_control_at is not None:
+            if observed_at < self._latest_control_at:
+                return False
+            if observed_at == self._latest_control_at and digest != self._latest_control_digest:
+                self._reject_integrity("conflicting system controls at the same produced_at")
+        previous = self.system_mode
+        self.system_mode = mode
+        self._latest_control_at = observed_at
+        self._latest_control_digest = digest
+        if mode is not previous:
+            log.warning("macro.mode_change", previous=previous.value, mode=mode.value)
+        return True
 
     async def _consume_control(self) -> None:
         async for envelope in self.bus.subscribe(Topics.SYSTEM_CONTROL, group="macro", consumer="control"):
@@ -660,6 +770,106 @@ class MacroService:
         finally:
             await self.bus.close()
 
+    def _allocation_fact(self, fact: AuditFact) -> StrategicAllocation:
+        if (
+            fact.topic != Topics.STRATEGIC_ALLOCATION
+            or fact.payload.get("source") != self.settings.service_name
+        ):
+            raise ValueError("allocation identity belongs to a different topic/source")
+        allocation = StrategicAllocation.model_validate(fact.payload)
+        if not allocation.message_id.startswith("macro:"):
+            raise ValueError("historical Macro allocation has an unknown trigger identity")
+        return allocation
+
+    def _validate_replayed_allocation(self, allocation: StrategicAllocation) -> None:
+        if self._integrity_issue is not None:
+            raise ValueError(f"history integrity failure: {self._integrity_issue}")
+        if set(allocation.strategy_weights) - set(self.settings.allowed_strategy_ids):
+            self._reject_integrity("historical allocation uses a strategy outside the configured allowlist")
+        total = allocation.stable_reserve_pct + sum(allocation.strategy_weights.values())
+        if not 0.9999 <= total <= 1.0001 or any(
+            not 0 <= weight <= 1 for weight in allocation.strategy_weights.values()
+        ):
+            self._reject_integrity("historical allocation does not conserve capital")
+
+    def restore_facts(self, facts: tuple[AuditFact, ...], reference: datetime) -> None:
+        """Replay input facts only: no gateway calls, publishes, ACKs or shock triggers."""
+        self._history_restored = False
+        self.history_status["state"] = "restoring"
+        try:
+            if len(facts) > self.settings.history_restore_max_rows:
+                raise ValueError("Macro audit history exceeds configured restore row limit")
+            previous_key: tuple[datetime, str] | None = None
+            for fact in facts:
+                key = (fact.produced_at, fact.payload["message_id"])
+                if previous_key is not None and key < previous_key:
+                    raise ValueError("restore facts are not in deterministic chronological order")
+                previous_key = key
+                if fact.produced_at > reference:
+                    raise ValueError("restored event postdates the recovery cutoff")
+                if fact.topic in {Topics.ACCOUNT_SNAPSHOT, Topics.ACCOUNT_SNAPSHOT_V2}:
+                    self._ingest_account(
+                        BusEnvelope(id=fact.payload["message_id"], topic=fact.topic, payload=fact.payload)
+                    )
+                    if (
+                        self._latest_account_captured_at is not None
+                        and self._latest_account_captured_at > reference
+                    ):
+                        raise ValueError("restored account capture postdates the recovery cutoff")
+                elif fact.topic == Topics.MARKET_SNAPSHOT:
+                    market = MarketSnapshot.model_validate(fact.payload)
+                    if self.settings.symbol_allowed(market.symbol):
+                        self._ingest_market(market)
+                elif fact.topic == Topics.SYSTEM_CONTROL:
+                    self._ingest_control(fact.payload)
+                elif fact.topic == Topics.STRATEGIC_ALLOCATION:
+                    allocation = self._allocation_fact(fact)
+                    trigger_id = allocation.message_id.removeprefix("macro:")
+                    self._remember(self._allocation_cache, trigger_id, allocation)
+                    if trigger_id.startswith("schedule:"):
+                        schedule_key = trigger_id.split(":context:", 1)[0]
+                        if self._last_schedule_key is not None and schedule_key < self._last_schedule_key:
+                            continue
+                        self._last_schedule_key = schedule_key
+                        self._pending_schedule_key = (
+                            schedule_key
+                            if ":context:" not in trigger_id
+                            and allocation.rationale.startswith("defensive fallback:")
+                            else None
+                        )
+            # Restore shock cooldown from actual prior effects, never replay historical triggers.
+            shock_ids = {
+                fact.payload["message_id"].removeprefix("macro:")
+                for fact in facts
+                if fact.topic == Topics.STRATEGIC_ALLOCATION
+            }
+            for fact in facts:
+                if fact.topic == Topics.MARKET_SNAPSHOT:
+                    trigger_id = f"shock:{fact.payload['message_id']}"
+                    if trigger_id in shock_ids:
+                        self._last_shock_at[fact.payload["symbol"]] = fact.produced_at
+            self._history_restored = True
+            self.history_status.update(
+                state="restored", restored_rows=len(facts), cutoff=reference.isoformat()
+            )
+        except Exception:
+            self.history_status["state"] = "failed"
+            raise
+
+    async def restore_history(self) -> None:
+        if not isinstance(self.bus, DurableMessageBus):
+            return
+        self._history_restored = False
+        try:
+            await self.bus.start()
+            reference = self._now()
+            facts = await load_audit_history(self.bus.database.pool, self.settings, reference)
+            self.restore_facts(facts, reference)
+        except Exception:
+            self.history_status["state"] = "failed"
+            raise
+        log.info("macro.history_restored", **self.history_status)
+
     async def run(self) -> None:  # pragma: no cover - production consumers are unbounded
         configure_logging(
             self.settings.log_level,
@@ -668,6 +878,7 @@ class MacroService:
         )
         log.info("macro.start", system_mode=self.system_mode.value)
         try:
+            await self.restore_history()
             async with asyncio.TaskGroup() as tasks:
                 tasks.create_task(self._scheduler(), name="schedule")
                 tasks.create_task(self._consume_accounts(), name="account-snapshots")

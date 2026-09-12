@@ -39,7 +39,7 @@ class _FakeGateway:
             parsed=AllocationOutput(
                 regime="BEAR",
                 stable_reserve_pct=0.5,
-                strategy_weights=[{"strategy_name": "delta_neutral", "weight": 0.5}],
+                strategy_weights=[{"strategy_name": "fixture_macro_strategy_v1", "weight": 0.5}],
                 max_gross_leverage=1.2,
                 rationale="real context",
             )
@@ -89,6 +89,7 @@ def _settings(**changes) -> MacroSettings:
         trading_symbols=["BTCUSDT", "ETHUSDT"],
         crash_pct_1h=10,
         shock_cooldown_s=3600,
+        allowed_strategy_ids=("fixture_macro_strategy_v1",),
         **changes,
     )
 
@@ -99,7 +100,8 @@ def _envelope(topic: str, payload: dict, envelope_id: str) -> BusEnvelope:
 
 def _account(captured_at: datetime) -> AccountSnapshot:
     return AccountSnapshot(
-        message_id="account-1",
+        message_id=f"account:{captured_at.isoformat()}",
+        produced_at=captured_at,
         source="execution",
         exchange="evedex",
         account_id="primary",
@@ -223,7 +225,7 @@ async def test_run_once_uses_real_account_and_market_context():
     )
 
     context = json.loads(gateway.calls[0]["user"])
-    assert context["portfolio"]["message_id"] == "account-1"
+    assert context["portfolio"]["message_id"] == f"account:{now.isoformat()}"
     assert context["portfolio"]["equity_usd"] == 12_000
     assert context["portfolio"]["positions"][0]["symbol"] == "BTCUSDT"
     assert context["performance"]["sample_count"] == 1
@@ -337,7 +339,7 @@ async def test_stale_account_abstains_without_model_call():
     allocation = await service.run_once(StrategicTrigger.SCHEDULE, trigger_id="stale-account")
 
     assert gateway.calls == []
-    assert allocation.stable_reserve_pct == 0.6
+    assert allocation.stable_reserve_pct == 1.0
     assert "account snapshot is stale" in allocation.rationale
 
 
@@ -349,7 +351,7 @@ async def test_missing_fresh_market_abstains_without_model_call():
     allocation = await service.run_once(StrategicTrigger.SCHEDULE, trigger_id="no-market")
 
     assert gateway.calls == []
-    assert allocation.stable_reserve_pct == 0.6
+    assert allocation.stable_reserve_pct == 1.0
     assert "0 fresh market snapshots" in allocation.rationale
 
 
@@ -392,6 +394,8 @@ async def test_real_market_snapshots_trigger_shock_allocation():
     baseline = _market(100, now - timedelta(minutes=61), message_id="baseline")
     crash = _market(88, now, message_id="crash")
     await service._process_market(_envelope(Topics.MARKET_SNAPSHOT, baseline.to_payload(), "base-env"))
+    for minute in range(60, 0, -1):
+        service._ingest_market(_market(100, now - timedelta(minutes=minute), message_id=f"minute-{minute}"))
 
     await service._process_market(_envelope(Topics.MARKET_SNAPSHOT, crash.to_payload(), "crash-env"))
 
@@ -423,6 +427,8 @@ async def test_future_snapshot_within_ingestion_skew_cannot_trigger_shock_early(
     baseline = _market(100, now - timedelta(hours=1), message_id="baseline")
     future_crash = _market(80, now + timedelta(seconds=1), message_id="future-crash")
     await service._process_market(_envelope(Topics.MARKET_SNAPSHOT, baseline.to_payload(), "baseline"))
+    for minute in range(59, 0, -1):
+        service._ingest_market(_market(100, now - timedelta(minutes=minute), message_id=f"minute-{minute}"))
 
     await service._process_market(
         _envelope(Topics.MARKET_SNAPSHOT, future_crash.to_payload(), "future-crash")
@@ -443,6 +449,8 @@ async def test_failed_shock_publish_is_unacked_and_reuses_cached_llm_output():
     service = MacroService(_settings(), gateway=gateway, bus=bus, clock=lambda: now)
     service._ingest_account(_envelope(Topics.ACCOUNT_SNAPSHOT, _account(now).to_payload(), "account"))
     await service._process_market(_envelope(Topics.MARKET_SNAPSHOT, baseline.to_payload(), "base-env"))
+    for minute in range(60, 0, -1):
+        service._ingest_market(_market(100, now - timedelta(minutes=minute), message_id=f"minute-{minute}"))
 
     await service._consume_markets()
     assert not any(operation[0] == "ack" for operation in bus.operations)
@@ -468,7 +476,7 @@ async def test_degraded_control_publishes_defensive_allocation_then_acks():
 
     assert service.system_mode is SystemMode.CONFLICT_SAFE
     assert gateway.calls == []
-    assert bus.published[0][1]["stable_reserve_pct"] == 0.6
+    assert bus.published[0][1]["stable_reserve_pct"] == 1.0
     assert [operation[0] for operation in bus.operations] == ["publish", "ack"]
 
 

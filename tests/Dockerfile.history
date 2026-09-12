@@ -1,0 +1,6 @@
+# Offline local drill harness: reuse installed runtime dependencies and pytest tools.
+# Not a production service image; never supply credentials at build time.
+FROM kairos-shadow-gate-macro-strategist:latest AS macro_runtime
+FROM kairos-execution-integration-tests:20260912
+COPY --from=macro_runtime /app/.venv/lib/python3.11/site-packages /opt/macro-runtime
+ENV PYTHONPATH=/work:/opt/macro-runtime:/opt/kairos-testdeps

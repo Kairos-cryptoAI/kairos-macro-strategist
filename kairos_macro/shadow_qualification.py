@@ -38,7 +38,7 @@ from kairos_persistence import DurableLLMUsageBudget, DurableMessageBus, Persist
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .config import MacroSettings
-from .prompts import MACRO_SYSTEM
+from .prompts import allocation_system_prompt
 from .strategist import AllocationOutput, MacroStrategist
 
 DEFAULT_CORPUS_RESOURCE = "macro_states_v1.json"
@@ -186,7 +186,7 @@ class _ScriptedGateway:
         return {
             "regime": regime,
             "stable_reserve_pct": reserve,
-            "strategy_weights": [{"strategy_name": "qualified_strategy", "weight": 1.0 - reserve}],
+            "strategy_weights": [{"strategy_name": "fixture_macro_strategy_v1", "weight": 1.0 - reserve}],
             "max_gross_leverage": leverage,
             "rationale": "labelled corpus result",
         }
@@ -217,9 +217,14 @@ async def qualify_macro_corpus(
     planned_cost_ceiling_usd: float = 0.0,
     maximum_planned_cost_usd: float = 0.0,
     selected_case_ids: Sequence[str] | None = None,
+    allowed_strategy_ids: tuple[str, ...] = (),
 ) -> MacroQualificationReport:
     observed = _ObservedGateway(gateway)
-    strategist = MacroStrategist(observed, source="macro-strategist:qualification")
+    strategist = MacroStrategist(
+        observed,
+        source="macro-strategist:qualification",
+        allowed_strategy_ids=allowed_strategy_ids,
+    )
     observations: list[CaseObservation] = []
 
     for case in _select_cases(corpus, selected_case_ids):
@@ -241,6 +246,8 @@ async def qualify_macro_corpus(
             reasons.append("model_not_called")
         if not schema_valid:
             reasons.append("model_output_not_schema_valid")
+        if allocation.rationale.startswith("defensive fallback:"):
+            reasons.append("allocation_rejected")
         if allocation.regime not in case.allowed_regimes:
             reasons.append("regime_outside_expected_set")
         if allocation.stable_reserve_pct < case.minimum_stable_reserve_pct:
@@ -337,6 +344,7 @@ def _select_cases(
 def planned_cost_ceiling_usd(
     corpus: MacroCorpus,
     selected_case_ids: Sequence[str] | None = None,
+    allowed_strategy_ids: tuple[str, ...] = (),
 ) -> float:
     prices = PriceTable()
     return math.fsum(
@@ -344,7 +352,7 @@ def planned_cost_ceiling_usd(
             "gpt-5.6-sol",
             TokenUsage(
                 input_tokens=BudgetedLLMGateway._input_token_ceiling(
-                    MACRO_SYSTEM,
+                    allocation_system_prompt(allowed_strategy_ids),
                     _context(case),
                     AllocationOutput,
                 ),
@@ -414,6 +422,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--corpus", type=Path)
     parser.add_argument("--case", action="append", dest="case_ids")
     parser.add_argument("--static", action="store_true")
+    parser.add_argument("--strategy-id", action="append", default=[], dest="strategy_ids")
     parser.add_argument("--openai-key-file", type=Path)
     parser.add_argument("--redis-url-file", type=Path)
     parser.add_argument("--database-url-file", type=Path)
@@ -429,11 +438,18 @@ def _parser() -> argparse.ArgumentParser:
 
 async def _run(args: argparse.Namespace) -> MacroQualificationReport:
     corpus, digest = load_corpus(args.corpus)
-    planned = planned_cost_ceiling_usd(corpus, args.case_ids)
+    allowed_ids = (
+        ("fixture_macro_strategy_v1",)
+        if args.static
+        else MacroSettings(allowed_strategy_ids=tuple(args.strategy_ids)).allowed_strategy_ids
+    )
+    planned = planned_cost_ceiling_usd(corpus, args.case_ids, allowed_ids)
     maximum = float(args.maximum_planned_cost_usd)
     if not math.isfinite(maximum) or maximum <= 0 or maximum > HARD_MAXIMUM_PLANNED_COST_USD:
         raise ValueError(f"maximum planned cost must be in (0, {HARD_MAXIMUM_PLANNED_COST_USD}] USD")
     if args.static:
+        if args.strategy_ids:
+            raise ValueError("--static uses its fixed fixture strategy ID only")
         if any((args.openai_key_file, args.redis_url_file, args.database_url_file)):
             raise ValueError("--static cannot be combined with secret files")
         return await qualify_macro_corpus(
@@ -443,7 +459,10 @@ async def _run(args: argparse.Namespace) -> MacroQualificationReport:
             corpus_sha256=digest,
             maximum_planned_cost_usd=maximum,
             selected_case_ids=args.case_ids,
+            allowed_strategy_ids=allowed_ids,
         )
+    if not allowed_ids:
+        raise ValueError("live shadow qualification requires explicit exact --strategy-id values")
     if not all((args.openai_key_file, args.redis_url_file, args.database_url_file)):
         raise ValueError("live qualification requires OpenAI, Redis and database secret files")
     if planned > maximum:
@@ -462,6 +481,7 @@ async def _run(args: argparse.Namespace) -> MacroQualificationReport:
             planned_cost_ceiling_usd=planned,
             maximum_planned_cost_usd=maximum,
             selected_case_ids=args.case_ids,
+            allowed_strategy_ids=allowed_ids,
         )
     finally:
         await gateway.close()

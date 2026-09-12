@@ -28,6 +28,7 @@ async def test_packaged_macro_corpus_passes_network_free_harness() -> None:
         corpus,
         _ScriptedGateway(),
         mode="STATIC_HARNESS",
+        allowed_strategy_ids=("fixture_macro_strategy_v1",),
         corpus_sha256=digest,
         maximum_planned_cost_usd=0.25,
     )
@@ -45,6 +46,7 @@ async def test_targeted_case_replay_does_not_recall_passed_states() -> None:
         corpus,
         _ScriptedGateway(),
         mode="STATIC_HARNESS",
+        allowed_strategy_ids=("fixture_macro_strategy_v1",),
         corpus_sha256=digest,
         maximum_planned_cost_usd=0.25,
         selected_case_ids=("bear_shock_drawdown",),
@@ -87,6 +89,7 @@ async def test_macro_corpus_rejects_unsafe_regime_reserve_and_leverage() -> None
         corpus,
         _UnsafeGateway(),
         mode="LIVE",
+        allowed_strategy_ids=("unsafe",),
         corpus_sha256=digest,
         planned_cost_ceiling_usd=1,
         maximum_planned_cost_usd=1,
@@ -147,3 +150,44 @@ def test_static_mode_rejects_secret_files_before_reading(tmp_path: Path) -> None
         )
         == 2
     )
+
+
+async def test_unconfigured_shadow_mapping_never_calls_model():
+    corpus, digest = load_corpus()
+    report = await qualify_macro_corpus(corpus, _ScriptedGateway(), mode="LIVE", corpus_sha256=digest)
+    assert report.status is QualificationStatus.FAIL
+    assert all("model_not_called" in item.reasons for item in report.observations)
+    assert all(item.cost_usd == 0 for item in report.observations)
+
+
+async def test_safe_looking_but_unknown_strategy_is_not_a_qualification_pass():
+    corpus, digest = load_corpus()
+    report = await qualify_macro_corpus(
+        corpus,
+        _ScriptedGateway(),
+        mode="STATIC_HARNESS",
+        corpus_sha256=digest,
+        allowed_strategy_ids=("some_other_exact_id",),
+    )
+    assert report.status is QualificationStatus.FAIL
+    assert all(item.model_schema_valid for item in report.observations)
+    assert all("allocation_rejected" in item.reasons for item in report.observations)
+
+
+def test_live_qualification_requires_exact_ids_before_reading_secrets(tmp_path: Path):
+    assert (
+        main(
+            [
+                "--openai-key-file",
+                str(tmp_path / "missing"),
+                "--redis-url-file",
+                str(tmp_path / "missing"),
+                "--database-url-file",
+                str(tmp_path / "missing"),
+                "--output",
+                str(tmp_path / "report.json"),
+            ]
+        )
+        == 2
+    )
+    assert not (tmp_path / "report.json").exists()

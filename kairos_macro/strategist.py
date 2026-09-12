@@ -9,7 +9,8 @@ from kairos_core.enums import MarketRegime, StrategicTrigger
 from kairos_llm import LLMWorkload
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .prompts import MACRO_SYSTEM
+from .config import STRATEGY_ID_PATTERN, validate_strategy_ids
+from .prompts import allocation_system_prompt
 
 Weight = Annotated[float, Field(ge=0.0, le=1.0)]
 
@@ -19,7 +20,7 @@ class StrategyWeightOutput(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    strategy_name: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    strategy_name: str = Field(min_length=1, max_length=128, pattern=STRATEGY_ID_PATTERN)
     weight: Weight
 
 
@@ -44,16 +45,22 @@ class AllocationOutput(BaseModel):
             raise ValueError("strategy names must be unique")
         return self
 
-    def strategy_weight_map(self) -> dict[str, float]:
+    def strategy_weight_map(self, allowed_strategy_ids: tuple[str, ...]) -> dict[str, float]:
         """Convert the provider-safe list into the canonical domain mapping."""
 
-        return {item.strategy_name: item.weight for item in self.strategy_weights}
+        weights = {item.strategy_name: item.weight for item in self.strategy_weights}
+        if set(weights) - set(allowed_strategy_ids):
+            raise ValueError("model returned an unconfigured strategy ID")
+        return weights
 
 
 class MacroStrategist:
-    def __init__(self, gateway: Any, *, source: str = "macro-strategist") -> None:
+    def __init__(
+        self, gateway: Any, *, source: str = "macro-strategist", allowed_strategy_ids: tuple[str, ...] = ()
+    ) -> None:
         self.gateway = gateway
         self.source = source
+        self.allowed_strategy_ids = validate_strategy_ids(allowed_strategy_ids)
 
     async def allocate(
         self,
@@ -65,9 +72,11 @@ class MacroStrategist:
         causation_id: str | None = None,
     ) -> StrategicAllocation:
         identity = self._identity_fields(message_id, correlation_id, causation_id)
+        if not self.allowed_strategy_ids:
+            return self.defensive(trigger, **identity, detail="no configured strategy IDs")
         try:
             result = await self.gateway.complete(
-                system=MACRO_SYSTEM,
+                system=allocation_system_prompt(self.allowed_strategy_ids),
                 user=context_json,
                 workload=LLMWorkload.MACRO_STRATEGIST,
                 schema=AllocationOutput,
@@ -82,7 +91,7 @@ class MacroStrategist:
                 source=self.source,
                 regime=output.regime,
                 stable_reserve_pct=output.stable_reserve_pct,
-                strategy_weights=output.strategy_weight_map(),
+                strategy_weights=output.strategy_weight_map(self.allowed_strategy_ids),
                 max_gross_leverage=output.max_gross_leverage,
                 triggered_by=trigger,
                 rationale=output.rationale,
@@ -110,8 +119,8 @@ class MacroStrategist:
             **self._identity_fields(message_id, correlation_id, causation_id),
             source=self.source,
             regime=MarketRegime.CHOP,
-            stable_reserve_pct=0.6,
-            strategy_weights={"delta_neutral": 0.4},
+            stable_reserve_pct=1.0,
+            strategy_weights={},
             max_gross_leverage=1.0,
             triggered_by=trigger,
             rationale=f"defensive fallback: {detail}"[:400],

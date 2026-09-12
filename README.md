@@ -29,6 +29,14 @@ the exact counts/method are included as `regime_evidence`.
 ## Safety and replay behavior
 
 - The model receives a strict Pydantic Structured Outputs schema.
+- `KAIROS_ALLOWED_STRATEGY_IDS` is an explicit list of exact `StrategyIntent.strategy_id`
+  values. Risk uses those exact dictionary keys; Macro never normalizes aliases, invents
+  strategy families, or maps a revision to a different ID. Unknown IDs are rejected even
+  at zero weight. Empty configuration bypasses the model. Every defensive fallback is
+  **100% stable reserve and no strategy weights**, not a fabricated delta-neutral sleeve.
+  The default is `[]`: no strategy is currently PAPER_APPROVED. Adding a name here does
+  not grant alpha approval, bypass the Strategy Engine registry, or permit trading.
+  `technical-canary` is prohibited; technical DEV scenarios must remain entirely LLM-free.
 - Missing reconciled account data yields a deterministic defensive allocation instead
   of sending an empty or invented portfolio to the model.
 - Stale/future account data or fewer than `KAIROS_MINIMUM_FRESH_MARKETS` fresh market
@@ -48,9 +56,14 @@ the exact counts/method are included as `regime_evidence`.
 - Input messages are acknowledged only after validation and all required publishing.
 - TaskGroup cancellation always closes both the LLM gateway and message bus.
 
-Sol calls reserve capacity in the shared PostgreSQL `kairos-llm-v1/openai`
-ledger before contacting OpenAI. The shadow qualification ceiling is exactly `$12`
-for OpenAI and `$1` for DeepSeek; an in-memory runtime denies paid calls and falls
+Sol calls reserve capacity in the shared PostgreSQL campaign
+`kairos-dev-qualification-v1` before contacting OpenAI. The cumulative qualification
+ceiling is `$12` for OpenAI and `$1` for DeepSeek, including prior committed and
+outstanding reservations across services and billing months. One authoritative
+paid-shadow database must be used by every paid caller; independent databases do not
+share a cap. Campaign adoption requires the persistence operator's explicit historical
+receipt; a fresh/unregistered database does not grant a fresh allowance.
+An in-memory runtime denies paid calls and falls
 back defensively. Macro accepts both legacy DRY_RUN account snapshots and strict,
 reconciled `AccountSnapshotV2` messages from the isolated PAPER contour.
 
@@ -67,13 +80,73 @@ uv run --locked kairos-macro-qualify --static \
   --output /tmp/kairos-macro-harness.json
 ```
 
-The network-free mode validates the harness without cost. A live run takes OpenAI,
+The network-free mode validates the harness without cost and explicitly permits only
+`fixture_macro_strategy_v1`; that fixture is not a tradable or approved strategy.
+A live shadow run requires repeatable `--strategy-id EXACT_ID` arguments before
+reading any secret file, as well as OpenAI,
 Redis and PostgreSQL one-value secret files, reserves every Sol call in the shared
 durable `kairos-llm-v1/openai` ledger and refuses a planned run above `$0.25` by
 default (hard maximum `$0.50`). Every report sets `live_orders_allowed=false`.
 Use repeatable `--case CASE_ID` selectors after a failure so passed Sol cases are
 not recalled. The qualification envelope reserves up to 1024 output tokens for
 xhigh reasoning and commits only the provider-reported actual cost.
+The planned token ceiling includes the trusted allowlist added to the system prompt.
+Schema-valid output with an unknown strategy still fails qualification; a defensive
+fallback is not counted as a successful model response.
+
+## Startup history recovery
+
+Before scheduling or consuming new input, the durable service reads existing
+`event_audit` facts in one PostgreSQL repeatable-read, read-only transaction. No new
+schema migration or historical rewrite is introduced. The normal durable-bus startup
+still applies its registered migrations and dispatches already-committed outbox effects.
+History restoration itself never calls a model, triggers historical shocks, publishes a
+new allocation, or ACKs transport messages.
+
+The recovery window is bounded by `KAIROS_ACCOUNT_HISTORY_WINDOW_S` (seven days) and
+`KAIROS_PRICE_HISTORY_WINDOW_S` (two hours). It restores reconciled account/equity
+history, per-symbol prices, the latest previously known control state, prior allocation
+identities, schedule recovery state and observed shock cooldowns. Produced/capture
+timestamps are preserved; old data must still pass the normal freshness checks.
+Queries exclude facts produced or persisted after the recovery cutoff. A causal snapshot
+does not imply that missing observations existed, or that a full week was observed.
+
+- `KAIROS_HISTORY_RESTORE_MAX_ROWS` limits the total audit load; exceeding it fails
+  startup rather than silently returning a partial window. Query/validation failures
+  prevent all new model calls. Restore service connectivity or adjust a justified bound
+  and restart; do not delete conflicting evidence or reset it to an empty history.
+- Use the optional exact `KAIROS_ACCOUNT_HISTORY_ACCOUNT_ID` and
+  `KAIROS_ACCOUNT_HISTORY_VERSION=legacy|v2` filters for a shared audit. Without them,
+  multiple account/exchange/version/environment identities fail closed. A V2 account's
+  trading mode and EVEDEX profile must also remain identical throughout its history;
+  DEV and PROD equity are never combined. The isolated paid-shadow database should
+  contain only the intended account/environment.
+- Audit envelope/payload identity, finite values, conflicting message IDs and conflicting
+  same-timestamp observations are checked. Exact replays do not add samples. Older
+  account/market deliveries do not replace newer state and are counted as reorders.
+  Reconciliation failure invalidates account context and clears its continuous segment.
+- `KAIROS_ACCOUNT_HISTORY_MAX_GAP_S` and `KAIROS_MARKET_HISTORY_MAX_GAP_S` are explicit
+  operational tolerances, both defaulting to 120 seconds. These snapshots are not a
+  guaranteed-period bar stream: the thresholds are not inferred producer intervals.
+  An observed gap starts a new continuous segment. A shock cannot span the missing
+  interval and account coverage cannot claim the discarded period as a full week.
+  `KAIROS_HISTORY_SAMPLE_LIMIT` separately bounds each in-memory time series.
+- `history_status` exposes state/cutoff/row count and gap/reorder/eviction counters without
+  portfolio PnL. Integrity failure remains fail-closed until a clean restart. Market
+  and account status still describe only observed coverage, not missing macro/on-chain feeds.
+- Old trigger redelivery beyond the RAM cache resolves the original allocation by its
+  durable message ID. It republishes the identical safe result without another model
+  call. If an old allocation names a now-unconfigured strategy, replay stops; the old
+  allocation is neither rewritten under the same ID nor replaced by another paid result.
+
+The SQL drill in `tests/test_history_postgres.py` is opt-in and refuses every database
+except the exact disposable `kairos_macro_test_20260912`. It checks the parsed URL and
+resolved `current_database()` before its first write, refuses existing evidence, inserts
+only synthetic audit rows, then verifies read-only causal reload, scope filtering, row
+overflow refusal and reconnect parity. It never migrates or deletes a database. The
+test database and its 68 fixture rows remain available as drill evidence. The optional
+`tests/Dockerfile.history` reuses the named local runtime/test images without downloading
+dependencies or including credentials; it is not a deployment image.
 
 ## Local development
 
