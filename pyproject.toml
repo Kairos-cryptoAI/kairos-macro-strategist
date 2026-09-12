@@ -32,8 +32,8 @@ required-version = "==0.12.3"
 
 [tool.uv.sources]
 kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "91cd95c8e5bd4393ed04606df08c205583092df7" }
-kairos-llm = { git = "https://github.com/Kairos-cryptoAI/kairos-llm.git", rev = "03ab2f292045c542e97cc30bbe69f20f36bea98d" }
-kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "9e7213a38f9a3d42f211d75e032e85a91cc4a662" }
+kairos-llm = { git = "https://github.com/Kairos-cryptoAI/kairos-llm.git", rev = "9e0e9e825963e9285fcbf1c416de93850ce24df1" }
+kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "730ff1a878305ffef80a07a615795208a0372091" }
 
 [project.scripts]
 kairos-macro-strategist = "kairos_macro.service:main"

@@ -617,7 +617,7 @@ dependencies = [
 [[package]]
 name = "kairos-llm"
 version = "0.1.0"
-source = { git = "https://github.com/Kairos-cryptoAI/kairos-llm.git?rev=03ab2f292045c542e97cc30bbe69f20f36bea98d#03ab2f292045c542e97cc30bbe69f20f36bea98d" }
+source = { git = "https://github.com/Kairos-cryptoAI/kairos-llm.git?rev=9e0e9e825963e9285fcbf1c416de93850ce24df1#9e0e9e825963e9285fcbf1c416de93850ce24df1" }
 dependencies = [
     { name = "aiohttp" },
     { name = "kairos-core" },
@@ -650,8 +650,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "kairos-core", git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=91cd95c8e5bd4393ed04606df08c205583092df7" },
-    { name = "kairos-llm", git = "https://github.com/Kairos-cryptoAI/kairos-llm.git?rev=03ab2f292045c542e97cc30bbe69f20f36bea98d" },
-    { name = "kairos-persistence", git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git?rev=9e7213a38f9a3d42f211d75e032e85a91cc4a662" },
+    { name = "kairos-llm", git = "https://github.com/Kairos-cryptoAI/kairos-llm.git?rev=9e0e9e825963e9285fcbf1c416de93850ce24df1" },
+    { name = "kairos-persistence", git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git?rev=730ff1a878305ffef80a07a615795208a0372091" },
     { name = "pydantic", specifier = ">=2.6,<3" },
 ]
 
@@ -668,7 +668,7 @@ dev = [
 [[package]]
 name = "kairos-persistence"
 version = "0.1.0"
-source = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git?rev=9e7213a38f9a3d42f211d75e032e85a91cc4a662#9e7213a38f9a3d42f211d75e032e85a91cc4a662" }
+source = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git?rev=730ff1a878305ffef80a07a615795208a0372091#730ff1a878305ffef80a07a615795208a0372091" }
 dependencies = [
     { name = "asyncpg" },
     { name = "kairos-core" },
