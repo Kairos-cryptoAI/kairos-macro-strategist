@@ -1,7 +1,7 @@
 # kairos-macro-strategist
 
 **Layer 4 — Macro Strategist.** The slow strategic layer selects the explicit
-`MACRO_STRATEGIST` LLM workload for its xhigh capital-allocation analysis. Model
+`MACRO_STRATEGIST` LLM workload on GPT-6 Sol for its xhigh capital-allocation analysis. Model
 and provider selection remain centralized in `kairos-llm`; this service never
 creates individual exchange orders.
 

@@ -1,4 +1,4 @@
-"""Frozen macro-state safety and quality gate for GPT-5.6 Sol.
+"""Frozen macro-state safety and quality gate for the Macro Strategist.
 
 The command never publishes allocations to the runtime bus. Live calls reserve their
 worst-case cost in the shared durable OpenAI ledger before provider access.
@@ -31,6 +31,7 @@ from kairos_llm import (
     LLMResult,
     LLMSettings,
     LLMWorkload,
+    ModelRouter,
     PriceTable,
     TokenUsage,
 )
@@ -347,9 +348,10 @@ def planned_cost_ceiling_usd(
     allowed_strategy_ids: tuple[str, ...] = (),
 ) -> float:
     prices = PriceTable()
+    model = ModelRouter().resolve(workload=LLMWorkload.MACRO_STRATEGIST).choice.model
     return math.fsum(
-        prices.cost(
-            "gpt-5.6-sol",
+        prices.reservation_cost(
+            model,
             TokenUsage(
                 input_tokens=BudgetedLLMGateway._input_token_ceiling(
                     allocation_system_prompt(allowed_strategy_ids),
