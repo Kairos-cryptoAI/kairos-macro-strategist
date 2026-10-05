@@ -8,7 +8,7 @@ import inspect
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from kairos_core.bus import BusEnvelope, MessageBus, build_bus
 from kairos_core.contracts import (
@@ -18,7 +18,7 @@ from kairos_core.contracts import (
     MarketSnapshot,
     StrategicAllocation,
 )
-from kairos_core.enums import Side, StrategicTrigger, SystemMode
+from kairos_core.enums import EvedexProfile, Side, StrategicTrigger, SystemMode, TradingMode
 from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
 from kairos_persistence import DurableLLMUsageBudget, DurableMessageBus
@@ -28,6 +28,9 @@ from .context import build_macro_context
 from .history import AuditFact, load_audit_history, load_prior_allocation, payload_digest_text, timestamp
 from .strategist import MacroStrategist
 from .triggers import ShockDetector, ShockEvent
+
+if TYPE_CHECKING:
+    from kairos_core.contracts.regime_capability import RegimeBoundAllocationV1, RegimeCapitalBasisV1
 
 log = get_logger("macro")
 
@@ -42,6 +45,7 @@ class MacroService:
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.settings = settings or MacroSettings()
+        self.regime_policy = self.settings.load_regime_policy()
         if bus is not None:
             self.bus = bus
         else:
@@ -89,6 +93,8 @@ class MacroService:
         self._price_history: dict[str, deque[tuple[datetime, float]]] = defaultdict(deque)
         self._last_shock_at: dict[str, datetime] = {}
         self._allocation_cache: OrderedDict[str, StrategicAllocation] = OrderedDict()
+        self._capital_bases: OrderedDict[str, RegimeCapitalBasisV1] = OrderedDict()
+        self._bound_allocations: OrderedDict[str, RegimeBoundAllocationV1] = OrderedDict()
         self._handled_market_ids: OrderedDict[str, None] = OrderedDict()
         self._handled_control_ids: OrderedDict[str, None] = OrderedDict()
         self._ingested_market_ids: OrderedDict[str, str] = OrderedDict()
@@ -438,6 +444,7 @@ class MacroService:
                 correlation_id = correlation_id or trigger_id
                 detail = trigger_detail or {"kind": trigger.value}
                 reference = self._now()
+                capital_account = self._latest_account
                 if self.system_mode in {SystemMode.CONFLICT_SAFE, SystemMode.LOCAL_QUANT_MODE}:
                     allocation = self.strategist.defensive(
                         trigger,
@@ -462,6 +469,25 @@ class MacroService:
                         correlation_id=correlation_id,
                         causation_id=causation_id,
                     )
+                if self.regime_policy is not None and isinstance(capital_account, AccountSnapshotV2):
+                    if (
+                        capital_account.account_id == self.settings.account_history_account_id
+                        and capital_account.trading_mode is TradingMode.PAPER
+                        and capital_account.evedex_profile is EvedexProfile.DEV
+                        and capital_account.reconciled
+                        and self._context_readiness_issue(reference) is None
+                    ):
+                        from kairos_core.contracts.regime_capability import RegimeCapitalBasisV1
+
+                        basis = RegimeCapitalBasisV1(
+                            allocation=allocation,
+                            policy_sha256=self.regime_policy.policy_sha256,
+                            source_set_sha256=self.regime_policy.source_set_sha256,
+                            account_id=capital_account.account_id,
+                            account_snapshot_id=capital_account.snapshot_id,
+                            account_captured_at_ms=capital_account.captured_at_ms,
+                        )
+                        self._remember(self._capital_bases, trigger_id, basis)
                 self._remember(self._allocation_cache, trigger_id, allocation)
 
             await self.bus.publish(Topics.STRATEGIC_ALLOCATION, allocation)
@@ -474,6 +500,102 @@ class MacroService:
                 trigger_id=trigger_id,
             )
             return allocation
+
+    async def handle_regime_observation(self, envelope: BusEnvelope) -> RegimeBoundAllocationV1:
+        """Bind deterministic evidence to already-produced capital, without an LLM call."""
+        if self.regime_policy is None:
+            raise ValueError("adaptive regime policy is not enabled")
+        from kairos_core.contracts.regime_capability import (
+            REGIME_BOUND_ALLOCATION_TOPIC,
+            REGIME_OBSERVATION_TOPIC,
+            RegimeBoundAllocationV1,
+            RegimeCapitalBasisV1,
+            RegimeObservationV1,
+        )
+
+        if envelope.topic != REGIME_OBSERVATION_TOPIC:
+            raise ValueError("regime observation arrived on the wrong versioned topic")
+        observation = RegimeObservationV1.model_validate(envelope.payload)
+        self.regime_policy.validate_observation(observation)
+        async with self._allocation_lock:
+            reference = self._now()
+            received_at_ms = int(reference.timestamp() * 1000)
+            if (
+                int(observation.produced_at.timestamp() * 1000) > received_at_ms
+                or received_at_ms > observation.expires_at_ms
+            ):
+                raise ValueError("regime evidence is future or expired at the trusted local receipt")
+            if (
+                self.system_mode is not SystemMode.NORMAL
+                or self._context_readiness_issue(reference) is not None
+            ):
+                raise ValueError("current Macro account/market readiness does not permit binding")
+            account = self._latest_account
+            if (
+                not isinstance(account, AccountSnapshotV2)
+                or account.account_id != self.settings.account_history_account_id
+                or account.trading_mode is not TradingMode.PAPER
+                or account.evedex_profile is not EvedexProfile.DEV
+                or not account.reconciled
+            ):
+                raise ValueError("adaptive allocation requires the exact reconciled PAPER DEV account")
+            if observation.observation_id is None:
+                raise ValueError("regime observation has no canonical identity")
+            bound = self._bound_allocations.get(observation.observation_id)
+            if bound is not None and bound.observation.model_dump(mode="json") != observation.model_dump(
+                mode="json"
+            ):
+                raise ValueError("conflicting duplicate regime observation envelope")
+            if bound is None:
+                eligible = [
+                    item
+                    for item in self._capital_bases.values()
+                    if int(item.allocation.produced_at.timestamp() * 1000)
+                    <= observation.intent.decision_ts_ms
+                ]
+                if not eligible:
+                    raise ValueError("no causal capital allocation was produced under this opt-in profile")
+                basis = max(eligible, key=lambda item: item.allocation.produced_at)
+                basis = RegimeCapitalBasisV1.model_validate_json(basis.model_dump_json())
+                if (
+                    basis.account_id != account.account_id
+                    or basis.source_set_sha256 != self.regime_policy.source_set_sha256
+                    or basis.policy_sha256 != self.regime_policy.policy_sha256
+                    or basis.allocation.source != self.settings.service_name
+                    or received_at_ms - int(basis.allocation.produced_at.timestamp() * 1000)
+                    > self.settings.regime_capital_max_age_s * 1000
+                ):
+                    raise ValueError(
+                        "capital scope, policy, source set or lifetime differs from the frozen binding"
+                    )
+                bound = RegimeBoundAllocationV1(
+                    source=self.settings.service_name,
+                    correlation_id=observation.intent.intent_id,
+                    causation_id=observation.message_id,
+                    capital_basis=basis,
+                    observation=observation,
+                    bound_at_ms=received_at_ms,
+                )
+                self._remember(self._bound_allocations, observation.observation_id, bound)
+            # Reparse replay cache as well: legacy StrategicAllocation remains
+            # mutable; its nested alteration must invalidate the bound digest.
+            bound = RegimeBoundAllocationV1.model_validate_json(bound.model_dump_json())
+            await self.bus.publish(REGIME_BOUND_ALLOCATION_TOPIC, bound)
+            return bound
+
+    async def _consume_regime_observations(self) -> None:
+        from kairos_core.contracts.regime_capability import REGIME_OBSERVATION_TOPIC
+
+        async for envelope in self.bus.subscribe(
+            REGIME_OBSERVATION_TOPIC,
+            group="macro",
+            consumer="regime-observations",
+        ):
+            try:
+                await self.handle_regime_observation(envelope)
+                await self.bus.ack(REGIME_OBSERVATION_TOPIC, envelope, group="macro")
+            except Exception:
+                log.exception("macro.regime_binding_failed", envelope_id=envelope.id)
 
     def _ingest_account(self, envelope: BusEnvelope) -> None:
         account: AccountSnapshot | AccountSnapshotV2
@@ -885,6 +1007,8 @@ class MacroService:
                 tasks.create_task(self._consume_accounts_v2(), name="account-snapshots-v2")
                 tasks.create_task(self._consume_markets(), name="market-snapshots")
                 tasks.create_task(self._consume_control(), name="system-control")
+                if self.regime_policy is not None:
+                    tasks.create_task(self._consume_regime_observations(), name="regime-observations")
         finally:
             await self.close()
 

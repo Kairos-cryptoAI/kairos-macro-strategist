@@ -1,7 +1,8 @@
 # kairos-macro-strategist
 
 **Layer 4 — Macro Strategist.** The slow strategic layer selects the explicit
-`MACRO_STRATEGIST` LLM workload on GPT-6 Sol for its xhigh capital-allocation analysis. Model
+`MACRO_STRATEGIST` LLM workload; the pinned gateway default is `gpt-6.1-sol` at
+`xhigh` for capital-allocation analysis. Model
 and provider selection remain centralized in `kairos-llm`; this service never
 creates individual exchange orders.
 
@@ -25,6 +26,47 @@ fresh technical and derivatives observations together with units and symbol cove
 structured bus topics exist. Missing evidence is uncertainty, never a neutral print.
 The `regime_hint` is a deterministic strict majority of fresh `quant_bias` values and
 the exact counts/method are included as `regime_evidence`.
+
+## Opt-in source-bound capital and regime capabilities
+
+The default `regime_policy_profile=legacy-v1` and existing `StrategicAllocation`
+topic/output are unchanged. The separate `adaptive-research-v1` profile adds a
+real subscriber to `kairos.market.regime_observation.v1` and publishes
+`kairos.macro.regime_bound_allocation.v1`; it is not enabled in any deployment.
+It requires an independently frozen full canonical policy hash/source-set hash,
+an exact V2 account scope and explicit strategy revisions already inside the
+existing Macro ID allowlist. Neither list promotes a PAPER strategy; the original
+Risk hard deny/allowlist, review, operator, venue/account readiness and sizing win.
+
+Only a newly produced allocation under this opt-in profile can acquire a capital
+basis. That basis records its actual Macro producer, policy/source set and the
+reconciled PAPER DEV account snapshot used when producing it. Historical unscoped
+legacy allocations are never relabelled. The subscriber binds this already-created
+capital to one immutable intent and the exact independently mapped deterministic
+detector/code/config/strategy revision; it does not call a model or invent a feed.
+Capital produced after the intent decision, foreign scope, source-set drift,
+changed nested allocation, expired/future evidence or revoked current readiness
+is refused. Digests and full JSON revalidation detect mutation of the nested
+legacy allocation. Successful binding is published before ACK; same-process retry
+republishes identical bytes without another paid call.
+
+The market event time must precede the strategy decision; actual observation and
+delivery may follow it before expiry and the trusted local receipt cutoff. The
+current strict-majority `regime_hint` and LLM allocation `regime` are not this
+deterministic detector's observations. In particular, `CHOP` does not prove `RANGE`.
+Weights remain capital ceilings only. Missing macro-release and on-chain sources
+remain honestly `unavailable` in the model context; they neither grant a capability
+nor masquerade as neutral external factors.
+
+Current capability is the offline-checked Macro subscriber -> bound topic -> real
+PAPER Risk branch. There is no deterministic publisher yet and no activated or
+promoted trading strategy. After restart, unscoped allocation history is still not
+adopted: a new opted-in capital allocation is required before new binding, and an
+old expired observation cannot be refreshed. Replay caches are bounded in-process;
+the existing durable journal/outbox remains authoritative, but this slice does not
+add durable capital-basis recovery. The reviewed new Core contract release must
+be pinned before future opt-in. Full adaptive PAPER/alpha/LIVE qualification and
+the missing detector/Execution integration require separate review.
 
 ## Safety and replay behavior
 
