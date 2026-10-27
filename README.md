@@ -29,11 +29,17 @@ the exact counts/method are included as `regime_evidence`.
 
 ## Opt-in source-bound capital and regime capabilities
 
-`MacroService(..., macro_capture=NativeMacroCapture(sink))` can use the existing
+`MacroService(..., macro_capture=...)` can use `NativeMacroCapture` with the existing
 native create-only session sink to retain the exact UTF-8 context before a fresh
 `allocate` call and the exact allocation/origin before publication. An original
-message ID is mandatory in this opt-in mode; a partial or unknown capture keeps
-that identity fenced and cannot trigger another model call in the session.
+message ID, an explicit durable `processing_claims` repository and one fixed
+`processing_scope_sha256` are mandatory in this opt-in allocation mode. It reuses
+the existing `claim_batch`/`complete_batch` processing contract, without creating
+new tables. The stable source/message key is claimed before capture/model work;
+successful completion is acknowledged only after output persistence. Partial or
+unknown capture/completion remains fenced across capture instances and process
+restarts using that same durable repository/scope. No claim reset or budget
+reservation release is supplied by this API.
 Capture failures escape rather than becoming newly published defensive output.
 No capture writer, key, producer registration or paid call is created by
 construction. Legacy/default behavior and pre-intent Macro selection are unchanged.

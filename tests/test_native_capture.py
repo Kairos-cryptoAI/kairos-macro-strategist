@@ -14,6 +14,35 @@ from kairos_core.enums import StrategicTrigger
 from kairos_macro.capture import MacroCaptureError, NativeMacroCapture
 from kairos_macro.strategist import MacroStrategist
 
+SCOPE = "a" * 64
+
+
+class ProcessingClaims:
+    """Shared in-memory model of permanent claim/complete semantics."""
+
+    def __init__(self):
+        self.rows = {}
+        self.claim_calls = []
+        self.complete_calls = []
+
+    async def claim_batch(self, scope_key, event_keys, attempt_id):
+        self.claim_calls.append((scope_key, event_keys, attempt_id))
+        claimed = []
+        for event_key in event_keys:
+            key = (scope_key, event_key)
+            if key not in self.rows:
+                self.rows[key] = (attempt_id, "pending")
+                claimed.append(event_key)
+        return tuple(claimed)
+
+    async def complete_batch(self, scope_key, event_keys, attempt_id):
+        self.complete_calls.append((scope_key, event_keys, attempt_id))
+        for event_key in event_keys:
+            key = (scope_key, event_key)
+            if self.rows.get(key) != (attempt_id, "pending"):
+                raise RuntimeError("claim ownership mismatch")
+            self.rows[key] = (attempt_id, "complete")
+
 
 class Sink:
     def __init__(self, *, fail_at=None):
@@ -47,11 +76,15 @@ class Gateway:
         )
 
 
-def strategist(sink, gateway, *, allowed=True):
+def strategist(sink, gateway, *, allowed=True, claims=None):
     return MacroStrategist(
         gateway,
         allowed_strategy_ids=("fixture_macro_strategy_v1",) if allowed else (),
-        capture=NativeMacroCapture(sink),
+        capture=NativeMacroCapture(
+            sink,
+            processing_claims=claims if claims is not None else ProcessingClaims(),
+            processing_scope_sha256=SCOPE,
+        ),
     )
 
 
@@ -79,6 +112,88 @@ async def test_original_context_and_output_are_bound_without_rewriting_clocks_or
 
 
 @pytest.mark.asyncio
+async def test_claim_is_completed_only_after_both_capture_records_are_written():
+    sink, gateway, claims = Sink(), Gateway(), ProcessingClaims()
+    await strategist(sink, gateway, claims=claims).allocate(
+        "{}", trigger=StrategicTrigger.SCHEDULE, message_id="macro:claim-complete"
+    )
+    scope, (event_key,), attempt = claims.claim_calls[0]
+    assert event_key == hashlib.sha256(b"macro-strategist\0macro:claim-complete").hexdigest()
+    assert scope == SCOPE and len(attempt) == 64
+    assert claims.rows[(scope, event_key)] == (attempt, "complete")
+    assert claims.complete_calls == [(scope, (event_key,), attempt)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_at", [0, 1])
+async def test_unknown_or_failed_capture_stays_claimed_across_capture_instances(fail_at):
+    claims = ProcessingClaims()
+    first_sink, first_gateway = Sink(fail_at=fail_at), Gateway()
+    first = strategist(first_sink, first_gateway, claims=claims)
+    with pytest.raises(MacroCaptureError, match="persistence"):
+        await first.allocate("{}", trigger=StrategicTrigger.SCHEDULE, message_id="macro:claim-pending")
+    scope, (event_key,), attempt = claims.claim_calls[0]
+    assert claims.rows[(scope, event_key)] == (attempt, "pending")
+
+    second_gateway, second_sink = Gateway(), Sink()
+    second = strategist(second_sink, second_gateway, claims=claims)
+    with pytest.raises(MacroCaptureError, match="already claimed"):
+        await second.allocate("{}", trigger=StrategicTrigger.SCHEDULE, message_id="macro:claim-pending")
+    assert not second_gateway.calls and not second_sink.rows
+    assert len(claims.claim_calls) == 2 and not claims.complete_calls
+
+
+@pytest.mark.asyncio
+async def test_capture_mode_without_claim_source_fails_closed_before_sink_or_gateway():
+    sink, gateway = Sink(), Gateway()
+    macro = MacroStrategist(
+        gateway, allowed_strategy_ids=("fixture_macro_strategy_v1",), capture=NativeMacroCapture(sink)
+    )
+    with pytest.raises(MacroCaptureError, match="durable processing-claims"):
+        await macro.allocate("{}", trigger=StrategicTrigger.SCHEDULE, message_id="macro:no-claims")
+    assert not gateway.calls and not sink.rows
+
+
+@pytest.mark.asyncio
+async def test_claim_completion_rejects_premature_and_forged_tokens():
+    sink, claims = Sink(), ProcessingClaims()
+    capture = NativeMacroCapture(sink, processing_claims=claims, processing_scope_sha256=SCOPE)
+    identity = {"message_id": "macro:claim-token"}
+    token = await capture.begin_claimed(
+        "{}", trigger=StrategicTrigger.SCHEDULE, identity=identity, source="macro-strategist"
+    )
+    with pytest.raises(MacroCaptureError, match="durable processing claim"):
+        await capture.complete_claim(token)
+    allocation = MacroStrategist(Gateway()).defensive(StrategicTrigger.SCHEDULE, **identity)
+    capture.finish(token, allocation, output_origin="NATIVE_DETERMINISTIC_FALLBACK")
+    forged = replace(token, claim_attempt_id="f" * 64)
+    with pytest.raises(MacroCaptureError, match="durable processing claim"):
+        await capture.complete_claim(forged)
+    await capture.complete_claim(token)
+    with pytest.raises(MacroCaptureError, match="durable processing claim"):
+        await capture.complete_claim(token)
+    assert len(claims.complete_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_output_persistence_failure_cannot_complete_claim():
+    sink, claims = Sink(fail_at=1), ProcessingClaims()
+    capture = NativeMacroCapture(sink, processing_claims=claims, processing_scope_sha256=SCOPE)
+    identity = {"message_id": "macro:claim-output-failure"}
+    token = await capture.begin_claimed(
+        "{}", trigger=StrategicTrigger.SCHEDULE, identity=identity, source="macro-strategist"
+    )
+    allocation = MacroStrategist(Gateway()).defensive(StrategicTrigger.SCHEDULE, **identity)
+    with pytest.raises(MacroCaptureError, match="persistence"):
+        capture.finish(token, allocation, output_origin="NATIVE_DETERMINISTIC_FALLBACK")
+    with pytest.raises(MacroCaptureError, match="durable processing claim"):
+        await capture.complete_claim(token)
+    scope, (event_key,), attempt = claims.claim_calls[0]
+    assert claims.rows[(scope, event_key)] == (attempt, "pending")
+    assert not claims.complete_calls
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("allowed", [False, True])
 async def test_original_fallback_is_captured_as_fallback_not_a_model_answer(allowed):
     sink, gateway = Sink(), Gateway(fail=True)
@@ -99,7 +214,7 @@ async def test_persistence_failure_escapes_and_original_identity_cannot_trigger_
         await macro.allocate("{}", trigger=StrategicTrigger.SCHEDULE, message_id="macro:synthetic-failure")
     assert "private" not in str(failed.value)
     assert len(gateway.calls) == fail_at
-    with pytest.raises(MacroCaptureError, match="already attempted"):
+    with pytest.raises(MacroCaptureError, match="already claimed"):
         await macro.allocate("{}", trigger=StrategicTrigger.SCHEDULE, message_id="macro:synthetic-failure")
     assert len(gateway.calls) == fail_at and len(sink.rows) == fail_at
 

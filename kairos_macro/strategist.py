@@ -81,15 +81,16 @@ class MacroStrategist:
         causation_id: str | None = None,
     ) -> StrategicAllocation:
         identity = self._identity_fields(message_id, correlation_id, causation_id)
-        token = (
-            self.capture.begin(context_json, trigger=trigger, identity=identity, source=self.source)
-            if self.capture
-            else None
-        )
+        token = None
+        if self.capture is not None:
+            token = await self.capture.begin_claimed(
+                context_json, trigger=trigger, identity=identity, source=self.source
+            )
         if not self.allowed_strategy_ids:
             allocation = self.defensive(trigger, **identity, detail="no configured strategy IDs")
             if self.capture is not None and token is not None:
                 self.capture.finish(token, allocation, output_origin="NATIVE_DETERMINISTIC_FALLBACK")
+                await self.capture.complete_claim(token)
             return allocation
         origin: Literal["NATIVE_MODEL", "NATIVE_DETERMINISTIC_FALLBACK"] = "NATIVE_MODEL"
         try:
@@ -127,6 +128,7 @@ class MacroStrategist:
         # output and republished as a newly captured deterministic fallback.
         if self.capture is not None and token is not None:
             self.capture.finish(token, allocation, output_origin=origin)
+            await self.capture.complete_claim(token)
         return allocation
 
     def defensive(
