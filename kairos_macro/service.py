@@ -23,6 +23,7 @@ from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
 from kairos_persistence import DurableLLMUsageBudget, DurableMessageBus
 
+from .capture import NativeMacroCapture
 from .config import MacroSettings
 from .context import build_macro_context
 from .history import AuditFact, load_audit_history, load_prior_allocation, payload_digest_text, timestamp
@@ -43,6 +44,7 @@ class MacroService:
         gateway: Any | None = None,
         bus: MessageBus | None = None,
         clock: Callable[[], datetime] | None = None,
+        macro_capture: NativeMacroCapture | None = None,
     ) -> None:
         self.settings = settings or MacroSettings()
         self.regime_policy = self.settings.load_regime_policy()
@@ -82,6 +84,7 @@ class MacroService:
             gateway,
             source=self.settings.service_name,
             allowed_strategy_ids=self.settings.allowed_strategy_ids,
+            capture=macro_capture,
         )
         self._clock = clock or (lambda: datetime.now(UTC))
 

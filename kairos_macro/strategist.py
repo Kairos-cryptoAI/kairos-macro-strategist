@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from kairos_core.contracts import StrategicAllocation
 from kairos_core.enums import MarketRegime, StrategicTrigger
 from kairos_llm import LLMWorkload
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .capture import NativeMacroCapture
 from .config import STRATEGY_ID_PATTERN, validate_strategy_ids
 from .prompts import allocation_system_prompt
 
@@ -56,11 +57,19 @@ class AllocationOutput(BaseModel):
 
 class MacroStrategist:
     def __init__(
-        self, gateway: Any, *, source: str = "macro-strategist", allowed_strategy_ids: tuple[str, ...] = ()
+        self,
+        gateway: Any,
+        *,
+        source: str = "macro-strategist",
+        allowed_strategy_ids: tuple[str, ...] = (),
+        capture: NativeMacroCapture | None = None,
     ) -> None:
         self.gateway = gateway
         self.source = source
         self.allowed_strategy_ids = validate_strategy_ids(allowed_strategy_ids)
+        if capture is not None and type(capture) is not NativeMacroCapture:
+            raise TypeError("the exact native Macro capture implementation is required")
+        self.capture = capture
 
     async def allocate(
         self,
@@ -72,8 +81,17 @@ class MacroStrategist:
         causation_id: str | None = None,
     ) -> StrategicAllocation:
         identity = self._identity_fields(message_id, correlation_id, causation_id)
+        token = (
+            self.capture.begin(context_json, trigger=trigger, identity=identity, source=self.source)
+            if self.capture
+            else None
+        )
         if not self.allowed_strategy_ids:
-            return self.defensive(trigger, **identity, detail="no configured strategy IDs")
+            allocation = self.defensive(trigger, **identity, detail="no configured strategy IDs")
+            if self.capture is not None and token is not None:
+                self.capture.finish(token, allocation, output_origin="NATIVE_DETERMINISTIC_FALLBACK")
+            return allocation
+        origin: Literal["NATIVE_MODEL", "NATIVE_DETERMINISTIC_FALLBACK"] = "NATIVE_MODEL"
         try:
             result = await self.gateway.complete(
                 system=allocation_system_prompt(self.allowed_strategy_ids),
@@ -86,7 +104,7 @@ class MacroStrategist:
                 if isinstance(result.parsed, AllocationOutput)
                 else AllocationOutput.model_validate(result.parsed)
             )
-            return StrategicAllocation(
+            allocation = StrategicAllocation(
                 **identity,
                 source=self.source,
                 regime=output.regime,
@@ -97,13 +115,19 @@ class MacroStrategist:
                 rationale=output.rationale,
             )
         except Exception:
-            return self.defensive(
+            origin = "NATIVE_DETERMINISTIC_FALLBACK"
+            allocation = self.defensive(
                 trigger,
                 message_id=message_id,
                 correlation_id=correlation_id,
                 causation_id=causation_id,
                 detail="invalid or failed model output",
             )
+        # Persistence failures must escape, not be mistaken for failed model
+        # output and republished as a newly captured deterministic fallback.
+        if self.capture is not None and token is not None:
+            self.capture.finish(token, allocation, output_origin=origin)
+        return allocation
 
     def defensive(
         self,

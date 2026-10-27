@@ -29,6 +29,21 @@ the exact counts/method are included as `regime_evidence`.
 
 ## Opt-in source-bound capital and regime capabilities
 
+`MacroService(..., macro_capture=NativeMacroCapture(sink))` can use the existing
+native create-only session sink to retain the exact UTF-8 context before a fresh
+`allocate` call and the exact allocation/origin before publication. An original
+message ID is mandatory in this opt-in mode; a partial or unknown capture keeps
+that identity fenced and cannot trigger another model call in the session.
+Capture failures escape rather than becoming newly published defensive output.
+No capture writer, key, producer registration or paid call is created by
+construction. Legacy/default behavior and pre-intent Macro selection are unchanged.
+
+These records describe the **application input/output**, not an official HTTP
+macro data source. They do not make unavailable macro/onchain factors available
+or authenticate the upstream account/market facts. Independent original source
+witnesses and the gateway's budgeted call records remain separate requirements.
+Direct no-context defensive outputs do not acquire a fabricated input capture.
+
 The default `regime_policy_profile=legacy-v1` and existing `StrategicAllocation`
 topic/output are unchanged. The separate `adaptive-research-v1` profile adds a
 real subscriber to `kairos.market.regime_observation.v1` and publishes
